@@ -23,10 +23,27 @@ import streamlit as st
 
 from app.vanna_client import get_vanna
 
+PRIMARY = "#EB671B"
+DARK = "#141415"
+
 st.set_page_config(page_title="Klume — Consulta de Volumes", page_icon="🚗")
 st.logo(
     os.path.join(os.path.dirname(__file__), "assets", "logo-klume.svg"),
     link="https://www.klume.com.br/",
+    size="large",
+)
+
+st.markdown(
+    f"""
+    <style>
+    div[data-testid="stAppViewContainer"] > .main {{
+        border-top: 5px solid {PRIMARY};
+    }}
+    h1 {{ color: {DARK}; }}
+    div[data-testid="stMetricValue"] {{ color: {PRIMARY}; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 # Streamlit Cloud/local: st.secrets é a única fonte de verdade pra chave.
@@ -55,6 +72,11 @@ DIMENSION_COLUMNS = [
 ]
 
 st.title("Consulta de Volumes")
+st.markdown(
+    f'<p style="color:{PRIMARY}; font-weight:600; margin-top:-0.8rem;">'
+    "Consultoria Automobilística — Dados, Análises e Pesquisas</p>",
+    unsafe_allow_html=True,
+)
 st.caption(
     "Pergunte em português sobre volumes de emplacamento (2016, 2020 e 2025 — "
     "cobertura parcial, mais anos chegam depois)."
@@ -114,6 +136,7 @@ if st.button("Consultar") and question:
         ]
 
 if st.session_state.base_question:
+    st.markdown(f'<hr style="border-top:2px solid {PRIMARY}; margin:0.5rem 0;">', unsafe_allow_html=True)
     chosen_dims = st.multiselect(
         "Dimensões (marque o que quer ver — o resultado é reagrupado automaticamente)",
         DIMENSION_COLUMNS,
