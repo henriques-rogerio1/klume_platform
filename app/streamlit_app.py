@@ -11,6 +11,7 @@ Streamlit Cloud: mesmo código, secrets vêm da UI do Streamlit Cloud.
 import io
 import os
 import sys
+import time
 
 # Streamlit Cloud roda o script sem a raiz do repo no sys.path (diferente do
 # nosso PYTHONPATH=. local) — sem isso, "from app.vanna_client import ..." e
@@ -21,6 +22,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from app.query_log import log_query
 from app.vanna_client import get_vanna
 
 PRIMARY = "#EB671B"
@@ -51,6 +53,28 @@ st.markdown(
 # os.getenv — reaproveita o helper existente sem duplicar lógica de conexão.
 os.environ["MOTHERDUCK_TOKEN"] = st.secrets["MOTHERDUCK_TOKEN"]
 ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
+
+# Login opcional: só exige quando [auth] estiver configurado no secrets
+# (precisa de client_id/client_secret de um provedor OIDC, ex: Google —
+# isso é uma conta/configuração externa, não algo que dá pra deixar pronto
+# sem essa etapa manual). Sem [auth] configurado o app continua funcionando
+# sem tela de login, como antes.
+AUTH_CONFIGURED = "auth" in st.secrets
+
+if AUTH_CONFIGURED and not st.user.is_logged_in:
+    st.title("Consulta de Volumes")
+    st.write("Faça login com sua conta Klume pra continuar.")
+    if st.button("Entrar com Google"):
+        st.login()
+    st.stop()
+
+USER_EMAIL = st.user.email if AUTH_CONFIGURED else "sem-login-local"
+
+if AUTH_CONFIGURED:
+    with st.sidebar:
+        st.write(f"Logado como **{USER_EMAIL}**")
+        if st.button("Sair"):
+            st.logout()
 
 # Mesma lista de dimensões de gold/build_volumes.py — mantém os dois em
 # sincronia manualmente por enquanto (repo pequeno, sem import cruzado
@@ -102,6 +126,8 @@ for key, default in [
 
 def run_query(sql: str) -> None:
     vn = get_vanna(ANTHROPIC_API_KEY)
+    question_for_log = st.session_state.base_question or ""
+    t0 = time.time()
     with st.spinner("Consultando..."):
         try:
             count = int(vn.run_sql(f"SELECT COUNT(*) AS n FROM ({sql}) t")["n"].iloc[0])
@@ -112,13 +138,22 @@ def run_query(sql: str) -> None:
                     f"marca, estado...) ou marque menos dimensões pra reduzir o resultado."
                 )
                 st.session_state.result_df = None
+                log_query(USER_EMAIL, question_for_log, sql, error=f"bloqueada: {count} linhas")
                 return
             if count > WARN_ROWS:
                 st.info(f"Resultado grande ({count:,} linhas) — a exportação pode demorar um pouco.")
             st.session_state.result_df = vn.run_sql(sql)
+            log_query(
+                USER_EMAIL,
+                question_for_log,
+                sql,
+                row_count=len(st.session_state.result_df),
+                duration_ms=int((time.time() - t0) * 1000),
+            )
         except Exception as e:
             st.error(f"A consulta falhou: {e}")
             st.session_state.result_df = None
+            log_query(USER_EMAIL, question_for_log, sql, error=str(e))
 
 
 question = st.text_input("Sua pergunta", placeholder="Ex: volume de motos por cor em 2025")
