@@ -21,18 +21,29 @@ import unicodedata
 
 
 COMBUSTIVEL_MAP = {
-    "gasolina":               "G",
-    "alcool/gasolina":        "G",   # flex — FIPE registra como gasolina
-    "gasolina/alcool":        "G",
-    "alcool":                 "A",
-    "etanol":                 "A",
-    "diesel":                 "D",
-    "diesel/gnv":             "D",
-    "eletrico":               "E",
-    "eletrico/gasolina":      "E",
-    "gas natural veicular":   "GNV",
-    "gnv":                    "GNV",
-    "hibrido":                "H",
+    "gasolina":                          "G",
+    "alcool/gasolina":                   "G",   # flex — FIPE registra como gasolina
+    "gasolina/alcool":                   "G",
+    "alcool":                            "A",
+    "etanol":                            "A",
+    "diesel":                            "D",
+    "diesel/gnv":                        "D",
+    "diesel/gas natural combustivel":    "D",
+    "alcool/gasolina/gas natural veicular": "G",  # tetraflex — mesma convenção de diesel/gnv
+    "eletrico":                          "E",
+    "eletrico/gasolina":                 "E",
+    "gasolina/eletrico":                 "E",
+    "eletrico/fonte externa":            "E",
+    "eletrico/fonte interna":            "E",
+    "gas natural veicular":              "GNV",
+    "gnv":                               "GNV",
+    "hibrido":                           "H",
+    "hibrido plug-in":                   "H",
+    "diesel/eletrico":                   "H",
+    "gasolina/alcool/eletrico":          "H",
+    "sem combustivel":                   "N",   # veículo sem motorização própria (ex: reboque)
+    # "gasogenio" fica deliberadamente fora do mapa: combustível histórico raro,
+    # sem categoria de uma letra que o represente corretamente — cai em "X".
 }
 
 
@@ -57,9 +68,29 @@ def extract_modelo_denatran(versao: str) -> str:
     return versao
 
 
+def normalize_combustivel_key(raw: str) -> str:
+    """
+    Normaliza o valor cru de combustível pra bater com as chaves de COMBUSTIVEL_MAP.
+
+    Diferente de normalize_text(), preserva o separador "/" (só remove os
+    espaços ao redor dele) em vez de trocá-lo por espaço — trocar quebraria
+    chaves como "alcool/gasolina". Também remove acento e o padding de
+    largura fixa que aparece em safras mais antigas do DENATRAN
+    (ex: "Álcool / Gasolina                    ").
+    """
+    if not raw:
+        return ""
+    s = raw.strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode()
+    s = s.lower()
+    s = re.sub(r"\s*/\s*", "/", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def map_combustivel(raw: str) -> str:
-    key = raw.lower().strip()
-    return COMBUSTIVEL_MAP.get(key, "X")
+    return COMBUSTIVEL_MAP.get(normalize_combustivel_key(raw), "X")
 
 
 def canonical_str(

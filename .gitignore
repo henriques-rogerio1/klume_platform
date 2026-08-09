@@ -9,3 +9,5 @@ venv/
 *.duckdb
 *.duckdb.wal
 .DS_Store
+.streamlit/secrets.toml
+app/chroma_store/

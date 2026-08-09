@@ -5,7 +5,12 @@ Estes testes são o contrato da plataforma — se quebrarem,
 a normalização divergiu e joins históricos podem ser afetados.
 """
 
-from silver.vehicle_key.canonical import canonical_str, normalize_text, map_combustivel
+from silver.vehicle_key.canonical import (
+    canonical_str,
+    normalize_text,
+    map_combustivel,
+    normalize_combustivel_key,
+)
 
 
 def test_denatran_remove_brand_prefix():
@@ -56,3 +61,29 @@ def test_ano_modelo_as_int_or_str():
     r1 = canonical_str("FIAT", "FIAT/ARGO 1.0", 2024, "FLEX")
     r2 = canonical_str("FIAT", "FIAT/ARGO 1.0", "2024", "FLEX")
     assert r1 == r2
+
+
+def test_combustivel_2016_accented_padded_maps_to_G():
+    # valor real do Bronze 2016 — acentuado e com padding de largura fixa
+    raw = "Álcool / Gasolina                                 "
+    assert map_combustivel(raw) == "G"
+
+
+def test_normalize_combustivel_key_preserves_slash_separator():
+    # normalize_text() trocaria "/" por espaço, o que quebraria as chaves
+    # de COMBUSTIVEL_MAP — normalize_combustivel_key() não pode fazer isso
+    assert normalize_combustivel_key("Álcool / Gasolina") == "alcool/gasolina"
+    assert "/" in normalize_combustivel_key("Diesel/GNV")
+
+
+def test_combustivel_hibrido_plugin_maps_to_H():
+    assert map_combustivel("Hibrido Plug-in") == "H"
+
+
+def test_combustivel_sem_combustivel_maps_to_N():
+    assert map_combustivel("Sem Combustivel") == "N"
+
+
+def test_combustivel_gasogenio_stays_unknown():
+    # combustível histórico raro, deliberadamente fora do mapa
+    assert map_combustivel("Gasogênio") == "X"
