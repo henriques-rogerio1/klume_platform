@@ -1,5 +1,6 @@
 """
-App interno de vendas: pergunta em texto -> SQL (Vanna) -> resultado -> export xlsx.
+App interno de vendas: pergunta em texto -> SQL (Vanna) -> preview com
+seleção de colunas -> gráfico (quando poucas dimensões) -> export xlsx/csv.
 
 Local: streamlit run app/streamlit_app.py  (usa .streamlit/secrets.toml)
 Streamlit Cloud: mesmo código, secrets vêm da UI do Streamlit Cloud.
@@ -15,6 +16,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 from app.vanna_client import get_vanna
@@ -33,6 +35,10 @@ st.caption(
     "cobertura parcial, mais anos chegam depois)."
 )
 
+if "result_df" not in st.session_state:
+    st.session_state.result_df = None
+    st.session_state.sql = None
+
 question = st.text_input("Sua pergunta", placeholder="Ex: volume de motos por cor em 2025")
 
 if st.button("Consultar") and question:
@@ -41,23 +47,62 @@ if st.button("Consultar") and question:
     with st.spinner("Gerando SQL..."):
         sql = vn.generate_sql(question)
 
-    st.code(sql, language="sql")
-
     with st.spinner("Consultando..."):
         try:
-            df = vn.run_sql(sql)
+            st.session_state.result_df = vn.run_sql(sql)
+            st.session_state.sql = sql
         except Exception as e:
             st.error(f"A consulta falhou: {e}")
-            df = None
+            st.session_state.result_df = None
 
-    if df is not None:
-        st.dataframe(df)
+if st.session_state.result_df is not None:
+    st.code(st.session_state.sql, language="sql")
+    full_df = st.session_state.result_df
+
+    if full_df.empty:
+        st.warning("A consulta rodou certo, mas não retornou nenhuma linha.")
+    else:
+        all_cols = list(full_df.columns)
+        selected_cols = st.multiselect("Colunas exibidas/exportadas", all_cols, default=all_cols)
+        df = full_df[selected_cols] if selected_cols else full_df
+
+        st.dataframe(df, use_container_width=True)
+
+        # Gráfico automático só quando dá pra ler visualmente: poucas
+        # colunas de dimensão (categoria/data) e uma única métrica numérica.
+        # Com muitas dimensões o gráfico vira ruído — melhor só a tabela.
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        dim_cols = [c for c in df.columns if c not in numeric_cols]
+
+        if 1 <= len(dim_cols) <= 2 and len(numeric_cols) == 1:
+            metric = numeric_cols[0]
+            is_temporal = pd.api.types.is_datetime64_any_dtype(df[dim_cols[0]])
+
+            if len(dim_cols) == 1 and is_temporal:
+                fig = px.line(df.sort_values(dim_cols[0]), x=dim_cols[0], y=metric, markers=True)
+            elif len(dim_cols) == 1:
+                top = df.sort_values(metric, ascending=False).head(30)
+                fig = px.bar(top, x=dim_cols[0], y=metric)
+            else:
+                top_combo = df.sort_values(metric, ascending=False).head(200)
+                fig = px.bar(top_combo, x=dim_cols[0], y=metric, color=dim_cols[1], barmode="group")
+
+            st.plotly_chart(fig, use_container_width=True)
+
+        col1, col2 = st.columns(2)
+
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        col1.download_button(
+            "Baixar CSV",
+            data=csv_bytes,
+            file_name="consulta_volumes.csv",
+            mime="text/csv",
+        )
 
         buffer = io.BytesIO()
         df.to_excel(buffer, index=False, engine="openpyxl")
         buffer.seek(0)
-
-        st.download_button(
+        col2.download_button(
             "Baixar Excel",
             data=buffer,
             file_name="consulta_volumes.xlsx",

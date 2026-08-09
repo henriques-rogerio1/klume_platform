@@ -26,6 +26,7 @@ DIMENSIONS = [
     "combustivel",
     "cor_predominante",
     "tipo_venda",
+    "municipio_emplacamento",
     "estado_emplacamento",
     "tipo_veiculo_principal",
     "cnpj_basico_faturado",
