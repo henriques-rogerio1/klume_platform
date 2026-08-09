@@ -1,6 +1,7 @@
 """
-App interno de vendas: pergunta em texto -> SQL (Vanna) -> preview com
-seleção de colunas -> gráfico (quando poucas dimensões) -> export xlsx/csv.
+App interno de vendas: pergunta em texto -> SQL (Vanna, editável) ->
+preview com seleção de colunas -> gráfico (quando poucas dimensões) ->
+export xlsx/csv.
 
 Local: streamlit run app/streamlit_app.py  (usa .streamlit/secrets.toml)
 Streamlit Cloud: mesmo código, secrets vêm da UI do Streamlit Cloud.
@@ -37,26 +38,38 @@ st.caption(
 
 if "result_df" not in st.session_state:
     st.session_state.result_df = None
-    st.session_state.sql = None
+if "sql_editor" not in st.session_state:
+    st.session_state.sql_editor = ""
+
+
+def run_query(sql: str) -> None:
+    vn = get_vanna(ANTHROPIC_API_KEY)
+    with st.spinner("Consultando..."):
+        try:
+            st.session_state.result_df = vn.run_sql(sql)
+        except Exception as e:
+            st.error(f"A consulta falhou: {e}")
+            st.session_state.result_df = None
+
 
 question = st.text_input("Sua pergunta", placeholder="Ex: volume de motos por cor em 2025")
 
 if st.button("Consultar") and question:
     vn = get_vanna(ANTHROPIC_API_KEY)
-
     with st.spinner("Gerando SQL..."):
-        sql = vn.generate_sql(question)
+        st.session_state.sql_editor = vn.generate_sql(question)
+    run_query(st.session_state.sql_editor)
 
-    with st.spinner("Consultando..."):
-        try:
-            st.session_state.result_df = vn.run_sql(sql)
-            st.session_state.sql = sql
-        except Exception as e:
-            st.error(f"A consulta falhou: {e}")
-            st.session_state.result_df = None
+if st.session_state.sql_editor:
+    st.text_area(
+        "SQL — edite aqui se quiser adicionar/trocar colunas antes de rodar de novo",
+        key="sql_editor",
+        height=140,
+    )
+    if st.button("Executar SQL"):
+        run_query(st.session_state.sql_editor)
 
 if st.session_state.result_df is not None:
-    st.code(st.session_state.sql, language="sql")
     full_df = st.session_state.result_df
 
     if full_df.empty:
