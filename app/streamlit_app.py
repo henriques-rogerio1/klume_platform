@@ -1,7 +1,8 @@
 """
-App interno de vendas: pergunta em texto -> SQL (Vanna, editável) ->
-preview com seleção de colunas -> gráfico (quando poucas dimensões) ->
-export xlsx/csv.
+App interno de vendas: pergunta em texto -> SQL (Vanna) -> seletor de
+dimensões (sem precisar saber SQL) -> preview -> gráfico (quando poucas
+dimensões) -> export xlsx/csv. Edição de SQL direta fica só como opção
+avançada, pra quem já sabe SQL.
 
 Local: streamlit run app/streamlit_app.py  (usa .streamlit/secrets.toml)
 Streamlit Cloud: mesmo código, secrets vêm da UI do Streamlit Cloud.
@@ -30,16 +31,39 @@ st.set_page_config(page_title="Klume — Consulta de Volumes", page_icon="🚗")
 os.environ["MOTHERDUCK_TOKEN"] = st.secrets["MOTHERDUCK_TOKEN"]
 ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
 
+# Mesma lista de dimensões de gold/build_volumes.py — mantém os dois em
+# sincronia manualmente por enquanto (repo pequeno, sem import cruzado
+# gold->app pra não acoplar as duas camadas por causa de uma constante).
+DIMENSION_COLUMNS = [
+    "data_emplacamento",
+    "marca",
+    "modelo",
+    "versao",
+    "segmentacao_atualizada",
+    "segmentacao_original",
+    "combustivel_normalizado",
+    "cor_predominante",
+    "tipo_venda",
+    "municipio_emplacamento",
+    "estado_emplacamento",
+    "tipo_veiculo_principal",
+    "match_tier",
+]
+
 st.title("Consulta de Volumes")
 st.caption(
     "Pergunte em português sobre volumes de emplacamento (2016, 2020 e 2025 — "
     "cobertura parcial, mais anos chegam depois)."
 )
 
-if "result_df" not in st.session_state:
-    st.session_state.result_df = None
-if "sql_editor" not in st.session_state:
-    st.session_state.sql_editor = ""
+for key, default in [
+    ("result_df", None),
+    ("sql_editor", ""),
+    ("base_question", None),
+    ("last_dims", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 def run_query(sql: str) -> None:
@@ -55,30 +79,48 @@ def run_query(sql: str) -> None:
 question = st.text_input("Sua pergunta", placeholder="Ex: volume de motos por cor em 2025")
 
 if st.button("Consultar") and question:
+    st.session_state.base_question = question
     vn = get_vanna(ANTHROPIC_API_KEY)
     with st.spinner("Gerando SQL..."):
-        st.session_state.sql_editor = vn.generate_sql(question)
-    run_query(st.session_state.sql_editor)
+        sql = vn.generate_sql(question)
+    st.session_state.sql_editor = sql
+    run_query(sql)
+    if st.session_state.result_df is not None:
+        st.session_state.last_dims = [
+            c for c in DIMENSION_COLUMNS if c in st.session_state.result_df.columns
+        ]
 
-if st.session_state.sql_editor:
-    st.text_area(
-        "SQL — edite aqui se quiser adicionar/trocar colunas antes de rodar de novo",
-        key="sql_editor",
-        height=140,
+if st.session_state.base_question:
+    chosen_dims = st.multiselect(
+        "Dimensões (marque o que quer ver — o resultado é reagrupado automaticamente)",
+        DIMENSION_COLUMNS,
+        default=st.session_state.last_dims or [],
     )
-    if st.button("Executar SQL"):
-        run_query(st.session_state.sql_editor)
+
+    if chosen_dims and chosen_dims != st.session_state.last_dims:
+        st.session_state.last_dims = chosen_dims
+        vn = get_vanna(ANTHROPIC_API_KEY)
+        augmented_question = (
+            f"{st.session_state.base_question}\n\n"
+            f"Retorne o resultado agrupado exatamente por estas colunas de "
+            f"gold.fato_volumes: {', '.join(chosen_dims)}. Some quantidade normalmente."
+        )
+        with st.spinner("Ajustando colunas..."):
+            sql = vn.generate_sql(augmented_question)
+        st.session_state.sql_editor = sql
+        run_query(sql)
+
+    with st.expander("Avançado: editar SQL diretamente"):
+        st.text_area("SQL", key="sql_editor", height=140)
+        if st.button("Executar SQL"):
+            run_query(st.session_state.sql_editor)
 
 if st.session_state.result_df is not None:
-    full_df = st.session_state.result_df
+    df = st.session_state.result_df
 
-    if full_df.empty:
+    if df.empty:
         st.warning("A consulta rodou certo, mas não retornou nenhuma linha.")
     else:
-        all_cols = list(full_df.columns)
-        selected_cols = st.multiselect("Colunas exibidas/exportadas", all_cols, default=all_cols)
-        df = full_df[selected_cols] if selected_cols else full_df
-
         st.dataframe(df, use_container_width=True)
 
         # Gráfico automático só quando dá pra ler visualmente: poucas
