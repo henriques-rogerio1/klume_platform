@@ -1,0 +1,8 @@
+# Cores extraídas direto do SVG da logo oficial (klume.com.br) — não são um
+# chute de paleta genérica.
+[theme]
+primaryColor = "#EB671B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F5F5"
+textColor = "#141415"
+font = "sans serif"

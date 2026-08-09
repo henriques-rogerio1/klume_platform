@@ -24,6 +24,10 @@ import streamlit as st
 from app.vanna_client import get_vanna
 
 st.set_page_config(page_title="Klume — Consulta de Volumes", page_icon="🚗")
+st.logo(
+    os.path.join(os.path.dirname(__file__), "assets", "logo-klume.svg"),
+    link="https://www.klume.com.br/",
+)
 
 # Streamlit Cloud/local: st.secrets é a única fonte de verdade pra chave.
 # Espelha MOTHERDUCK_TOKEN pro ambiente porque silver/db/connection.py lê via
