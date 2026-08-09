@@ -7,6 +7,12 @@ Streamlit Cloud: mesmo código, secrets vêm da UI do Streamlit Cloud.
 
 import io
 import os
+import sys
+
+# Streamlit Cloud roda o script sem a raiz do repo no sys.path (diferente do
+# nosso PYTHONPATH=. local) — sem isso, "from app.vanna_client import ..." e
+# os imports de "silver.*" dentro dele quebram com ModuleNotFoundError.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import streamlit as st
