@@ -56,6 +56,14 @@ st.caption(
     "cobertura parcial, mais anos chegam depois)."
 )
 
+# gold.fato_volumes tem ~7.7M linhas — uma pergunta sem filtro suficiente
+# pode devolver quase a tabela inteira, o que (a) estoura o limite físico
+# de 1.048.576 linhas do Excel e (b) pode esgotar a memória do Streamlit
+# Cloud (plano gratuito, ~1GB) pra todo mundo, não só pra quem perguntou.
+# Por isso checa a contagem ANTES de trazer o resultado inteiro pra memória.
+MAX_ROWS = 300_000
+WARN_ROWS = 50_000
+
 for key, default in [
     ("result_df", None),
     ("sql_editor", ""),
@@ -70,6 +78,17 @@ def run_query(sql: str) -> None:
     vn = get_vanna(ANTHROPIC_API_KEY)
     with st.spinner("Consultando..."):
         try:
+            count = int(vn.run_sql(f"SELECT COUNT(*) AS n FROM ({sql}) t")["n"].iloc[0])
+            if count > MAX_ROWS:
+                st.error(
+                    f"Essa consulta devolveria {count:,} linhas — passou do limite de "
+                    f"segurança ({MAX_ROWS:,}). Adicione mais filtro na pergunta (ano, "
+                    f"marca, estado...) ou marque menos dimensões pra reduzir o resultado."
+                )
+                st.session_state.result_df = None
+                return
+            if count > WARN_ROWS:
+                st.info(f"Resultado grande ({count:,} linhas) — a exportação pode demorar um pouco.")
             st.session_state.result_df = vn.run_sql(sql)
         except Exception as e:
             st.error(f"A consulta falhou: {e}")
