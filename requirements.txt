@@ -9,3 +9,4 @@ openpyxl>=3.1.0
 vanna[chromadb,anthropic]>=2.0.2
 plotly>=6.9.0
 authlib>=1.3.2
+boto3>=1.35.0

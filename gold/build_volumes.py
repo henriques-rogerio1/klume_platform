@@ -218,6 +218,24 @@ def build_compatibility_view(con) -> None:
     """)
 
 
+def build_current_period_views(con) -> None:
+    """
+    Datamarts de ano/mês corrente como views — sem duplicar dado (mesma fato+dimensões
+    de gold.fato_volumes), e sem precisar de rebuild na virada do ano/mês porque usam
+    CURRENT_DATE na própria definição.
+    """
+    con.execute("""
+        CREATE OR REPLACE VIEW gold.fato_volumes_ano_atual AS
+        SELECT * FROM gold.fato_volumes
+        WHERE date_part('year', data_emplacamento) = date_part('year', CURRENT_DATE)
+    """)
+    con.execute("""
+        CREATE OR REPLACE VIEW gold.fato_volumes_mes_atual AS
+        SELECT * FROM gold.fato_volumes
+        WHERE date_trunc('month', data_emplacamento) = date_trunc('month', CURRENT_DATE)
+    """)
+
+
 def main():
     con = get_connection("motherduck")
     con.execute("CREATE SCHEMA IF NOT EXISTS gold")
@@ -235,6 +253,8 @@ def main():
     build_fato_volumes_base(con)
     print("Construindo view de compatibilidade gold.fato_volumes...")
     build_compatibility_view(con)
+    print("Construindo views de ano/mês corrente...")
+    build_current_period_views(con)
     print("Aplicando comentários (ontologia)...")
     apply_comments(con)
 
