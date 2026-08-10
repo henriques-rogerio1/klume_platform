@@ -41,6 +41,17 @@ st.set_page_config(page_title="Klume — Upload de Dados", page_icon="📥")
 
 os.environ["MOTHERDUCK_TOKEN"] = st.secrets["MOTHERDUCK_TOKEN"]
 
+with st.expander("🔧 Diagnóstico temporário — secrets AWS (remover depois de resolver o SignatureDoesNotMatch)"):
+    for _k in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "S3_BUCKET"]:
+        _v = st.secrets.get(_k, None)
+        if _v is None:
+            st.write(f"{_k}: **não definido**")
+        else:
+            st.write(
+                f"{_k}: len={len(_v)}, últimos 4 = `{_v[-4:]}`, "
+                f"tem espaço/quebra sobrando = {_v != _v.strip()}"
+            )
+
 st.title("Upload de Dados — Volumes DENATRAN")
 st.caption(
     "Página operacional: sobe um arquivo XLSX novo pro Bronze (MotherDuck + S3). "
