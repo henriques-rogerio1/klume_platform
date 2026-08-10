@@ -48,6 +48,13 @@ DOCUMENTATION = [
     "Pra filtrar por cidade use municipio_emplacamento ILIKE '%nome%' (não '=', a "
     "grafia pode variar) — não precisa combinar com estado_emplacamento junto, o nome "
     "do município já é específico o suficiente.",
+    "segmentacao_klume é DIFERENTE de segmentacao_atualizada: segmentacao_atualizada "
+    "mostra a classificação como estava registrada NAQUELA venda específica (fiel ao "
+    "histórico — uma pergunta sobre 2023 mostra a classificação de 2023, mesmo que tenha "
+    "mudado depois). segmentacao_klume mostra a classificação MAIS RECENTE conhecida pra "
+    "aquele veículo, independente de quando foi vendido — é a visão 'atual'/'hoje', não "
+    "histórica. Se a pergunta não deixar claro qual das duas quer, prefira "
+    "segmentacao_atualizada (mantém compatibilidade com o que já era respondido antes).",
 ]
 
 EXAMPLES = [
