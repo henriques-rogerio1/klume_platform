@@ -68,6 +68,16 @@ A primeira versão de `gold.fato_volumes` era uma única tabela desnormalizada (
 - Chaves precisam ser inteiras pequenas, não hash, porque Tableau/Power BI sofrem em
   performance de join com hash de 64 bits.
 
+A ontologia vive no próprio banco: `COMMENT ON COLUMN` em cada coluna não óbvia, e
+`COMMENT ON TABLE` com o **grão** de cada tabela como frase verificável ("uma linha
+representa..."), aplicados em `gold/build_volumes.py::apply_comments` /
+`apply_grain_comments`. Metodologia: skill `dimensional-modeler` (Kimball, ver
+`~/.claude/skills/dimensional-modeler/SKILL.md`) — grão declarado, SCD por atributo,
+seleção de linha vencedora sempre completa (nunca `arg_max`/`ROW_NUMBER` por coluna
+isolada), determinismo testado construindo o Gold duas vezes seguidas e comparando
+linha a linha (`EXCEPT` nos dois sentidos, não só contagem/soma) — as 5 tabelas do
+star schema batem 0 diferenças entre builds, chaves surrogate incluídas.
+
 ### As duas dimensões de veículo (a decisão mais importante do modelo)
 
 `vehicle_key` (do Silver) não determina sozinho `segmentacao_atualizada`,
@@ -87,14 +97,22 @@ Solução: duas dimensões, dois propósitos, nenhuma inventando uma linha do te
 - **`gold.dim_veiculo_atual`** — Type 1 de propósito. Uma linha por `vehicle_key`,
   pegando o registro mais recente completo (nunca por coluna isolada, pra não montar
   uma combinação que nunca existiu). Alimenta a coluna `segmentacao_klume` — "nosso
-  melhor entendimento atual", independente de quando o veículo foi vendido.
+  melhor entendimento atual", independente de quando o veículo foi vendido. Seleção
+  via `QUALIFY ROW_NUMBER() OVER (PARTITION BY vehicle_key ORDER BY ...)` com
+  desempate total (todas as colunas do SELECT, incluindo `combustivel_normalizado` —
+  faltava antes, existiam ~5.600 grupos de empate reais nos dados; nenhum mudava o
+  resultado hoje, mas o `ORDER BY` não era total).
 
 ### Demais dimensões
 
 - **`gold.dim_geografia`** — chave natural `codigo_municipio` (código IBGE, ~5.572
   valores, bate com o número real de municípios do Brasil). Usar o nome em texto como
   chave seria errado — nomes colidem entre estados (ex: "Bom Jesus" existe em 6).
-  Linha sentinela (`-1`, `'NÃO IDENTIFICADO'`) pra nunca deixar um `JOIN` comum
+  Município e estado vêm da mesma linha vencedora (`QUALIFY ROW_NUMBER`), não de
+  `arg_max` independente por coluna — nos dados atuais nunca divergia (nenhum
+  `codigo_municipio` observado com mais de um nome/estado), mas `arg_max` por coluna
+  isolada podia, em tese, misturar município de uma data com estado de outra. Linha
+  sentinela (`-1`, `'NÃO IDENTIFICADO'`) pra nunca deixar um `JOIN` comum
   derrubar linha silenciosamente (~23% dos registros não têm código IBGE — mas TÊM o
   nome do município em texto, por isso o texto também fica direto na fato, não só
   via essa dimensão).

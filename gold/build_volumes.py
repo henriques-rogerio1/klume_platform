@@ -60,6 +60,42 @@ COMMENTS = {
 }
 
 
+# Grão de cada tabela como frase verificável (metodologia dimensional-modeler:
+# "uma linha representa [evento/estado] de [entidade] para [dimensões] em [momento],
+# com [medidas]") — documentado no próprio banco via COMMENT ON TABLE, não só em
+# docstring, pra quem abrir o catálogo direto (MotherDuck UI, Power BI, Tableau)
+# ver o grão sem precisar ler o código Python.
+GRAIN = {
+    "fato_volumes_base": "Uma linha representa a soma de veículos emplacados "
+    "(SUM(quantidade)) para uma combinação única de data_key, veiculo_key "
+    "(atributos observados na venda), veiculo_atual_key (melhor entendimento atual), "
+    "codigo_municipio, cor_predominante, tipo_venda, match_tier e "
+    "cnpj_basico_faturado — não existe grão de venda individual, só a soma por essa "
+    "combinação de atributos (mesmo grão de _fato_pre, que agrega silver.veiculos "
+    "por GROUP BY ALL).",
+    "dim_veiculo_observado": "Uma linha representa uma combinação de atributos de "
+    "veículo (vehicle_key, marca, modelo, versao, ano_modelo, combustivel_normalizado, "
+    "segmentacao_atualizada, segmentacao_original, tipo_veiculo_principal) que "
+    "realmente coexistiu em pelo menos um registro do Silver — histórico fiel, sem "
+    "inferir data de vigência.",
+    "dim_veiculo_atual": "Uma linha representa o melhor entendimento atual (Type 1) "
+    "de um vehicle_key — os atributos observados na venda mais recente desse "
+    "veículo, selecionados como linha completa (nunca arg_max por coluna isolada).",
+    "dim_geografia": "Uma linha representa um codigo_municipio (código IBGE) com o "
+    "nome de município e estado mais recentemente observados (linha completa, não "
+    "arg_max por coluna); -1 é a linha sentinela para 'sem código IBGE informado'.",
+    "dim_data": "Uma linha representa um dia do calendário contínuo entre a menor e "
+    "a maior data_emplacamento observada em silver.veiculos — inclui dias sem "
+    "nenhuma venda.",
+}
+
+
+def apply_grain_comments(con) -> None:
+    for table, text in GRAIN.items():
+        text_escaped = text.replace("'", "''")
+        con.execute(f"COMMENT ON TABLE gold.{table} IS '{text_escaped}'")
+
+
 def apply_comments(con) -> None:
     for table, cols in COMMENTS.items():
         for col, text in cols.items():
@@ -106,21 +142,29 @@ def build_dim_veiculo_atual(con) -> None:
             QUALIFY row_number() OVER (
                 PARTITION BY vehicle_key
                 ORDER BY data_emplacamento DESC, marca, modelo, versao, ano_modelo,
-                         segmentacao_atualizada, segmentacao_original, tipo_veiculo_principal
+                         combustivel_normalizado, segmentacao_atualizada,
+                         segmentacao_original, tipo_veiculo_principal
             ) = 1
         )
     """)
 
 
 def build_dim_geografia(con) -> None:
+    # Linha vencedora completa por codigo_municipio (não arg_max independente por
+    # coluna) — município e estado sempre vêm da MESMA linha de origem, nunca de
+    # datas diferentes. Hoje isso nunca diverge (nenhum codigo_municipio observado
+    # com mais de um nome/estado ao longo do tempo), mas o padrão independente é
+    # frágil pra dados futuros (ex: variação de grafia entre safras).
     con.execute("""
         CREATE OR REPLACE TABLE gold.dim_geografia AS
-        SELECT codigo_municipio,
-               arg_max(municipio_emplacamento, data_emplacamento) AS municipio,
-               arg_max(estado_emplacamento, data_emplacamento) AS estado
+        SELECT codigo_municipio, municipio_emplacamento AS municipio,
+               estado_emplacamento AS estado
         FROM silver.veiculos
         WHERE codigo_municipio IS NOT NULL
-        GROUP BY codigo_municipio
+        QUALIFY row_number() OVER (
+            PARTITION BY codigo_municipio
+            ORDER BY data_emplacamento DESC, municipio_emplacamento, estado_emplacamento
+        ) = 1
 
         UNION ALL
 
@@ -255,6 +299,8 @@ def main():
     build_compatibility_view(con)
     print("Construindo views de ano/mês corrente...")
     build_current_period_views(con)
+    print("Aplicando comentários de grão (COMMENT ON TABLE)...")
+    apply_grain_comments(con)
     print("Aplicando comentários (ontologia)...")
     apply_comments(con)
 
