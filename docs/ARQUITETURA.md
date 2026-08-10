@@ -154,6 +154,23 @@ conectam direto (Tableau/Power BI) usam as tabelas físicas; o app usa a view.
 - **Histórico de queries**: `app/query_log.py` grava toda pergunta em
   `app.query_log` no MotherDuck (usuário, pergunta, SQL, linhas, duração) — base pra
   futuramente promover perguntas frequentes a exemplos de treino do Vanna.
+- **Upload de dados** (`app/pages/1_Upload_Dados.py`) — página operacional, não pra
+  vendedor: XLSX novo → casa colunas com `staging.bronze_{ano}` por nome → insere no
+  MotherDuck → dual-write pro S3 → botão separado (não automático) pra rodar
+  Silver+Gold. Duas proteções, adicionadas depois de um upload de teste (1958)
+  deixar 30 linhas órfãs no Bronze por quebrar no passo do S3 (secret AWS não
+  configurado na Streamlit Cloud, mas o INSERT no MotherDuck já tinha rodado):
+  - **`app.upload_log`** (ts, filename, hash SHA-256 do arquivo, ano, rows_inserted,
+    s3_ok) — hash registrado logo após o INSERT no MotherDuck ter sucesso, **antes**
+    de tentar o S3, pra uma falha no S3 não deixar uma reexecução vulnerável a
+    duplicar linhas. Arquivo com hash já visto no log é bloqueado antes de tocar em
+    qualquer tabela. Falha no S3 é capturada (não derruba a página) e fica visível
+    como `s3_ok = false`, em vez de crash sem rastro do que já foi inserido.
+  - **Schema validation**: rejeita o arquivo antes de qualquer insert se faltar
+    alguma coluna obrigatória (`Data de Emplacamento`, `Marca`, `Modelo`,
+    `Quantidade`) ou se menos de 50% das colunas do formato DENATRAN de referência
+    (`staging.bronze_2024`) baterem — antes disso, coluna faltando virava `NULL`
+    silencioso, sem checagem de que o arquivo era o formato certo.
 
 ## Decisão de acesso: interno vs. externo
 
@@ -183,6 +200,11 @@ Duas superfícies diferentes pro mesmo Gold, não um mecanismo só:
   Deve reconstruir `veiculo_atual_key` de qualquer forma se essa migração
   reprocessar dados.
 - **MCP pra clientes externos** — não iniciado.
+- **Secrets AWS não configurados na Streamlit Community Cloud** — só existem no
+  `.streamlit/secrets.toml` local (gitignored). Passo manual pendente: colar
+  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION`/`S3_BUCKET` na UI de
+  "Secrets" do app publicado, senão o dual-write pro S3 continua falhando em
+  produção (o MotherDuck é gravado normalmente; só a cópia S3 fica pendente).
 - **4 databases MotherDuck órfãos** (`bronze`, `silver`, `gold`, `my_db`, de
   fevereiro, quase vazios, sem relação com os schemas reais dentro de
   `Klume_DB_Cloud`) — seguros de apagar, ainda não confirmado com o usuário.
