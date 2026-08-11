@@ -93,6 +93,8 @@ DIMENSION_COLUMNS = [
     "estado_emplacamento",
     "tipo_veiculo_principal",
     "match_tier",
+    "segmentacao_klume",
+    "cnpj_basico_faturado",
 ]
 
 st.title("Consulta de Volumes")
