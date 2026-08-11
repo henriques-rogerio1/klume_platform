@@ -156,8 +156,13 @@ conectam direto (Tableau/Power BI) usam as tabelas físicas; o app usa a view.
   futuramente promover perguntas frequentes a exemplos de treino do Vanna.
 - **Upload de dados** (`app/pages/1_Upload_Dados.py`) — página operacional, não pra
   vendedor: XLSX novo → casa colunas com `staging.bronze_{ano}` por nome → insere no
-  MotherDuck → dual-write pro S3 → botão separado (não automático) pra rodar
-  Silver+Gold. Duas proteções, adicionadas depois de um upload de teste (1958)
+  MotherDuck → dual-write pro S3 → **Silver+Gold reconstroem automaticamente, sem
+  botão** (mudou de manual pra obrigatório em 2026-08-11: arquivo novo chega poucas
+  vezes por mês, então o custo de sempre reprocessar é baixo, e um clique manual
+  esquecido deixava o Gold desatualizado sem nenhum aviso). A tela mostra a pipeline
+  como etapas nomeadas (`st.status`, estilo Airflow/CI — cada etapa rotulada com a
+  função/script por trás), pra facilitar isolar em qual passo algo quebrou.
+  Duas proteções, adicionadas depois de um upload de teste (1958)
   deixar 30 linhas órfãs no Bronze por quebrar no passo do S3 (secret AWS não
   configurado na Streamlit Cloud, mas o INSERT no MotherDuck já tinha rodado):
   - **`app.upload_log`** (ts, filename, hash SHA-256 do arquivo, ano, rows_inserted,
