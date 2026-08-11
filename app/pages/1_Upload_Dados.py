@@ -2,9 +2,17 @@
 Página operacional (não é pra vendedor usar) — upload de arquivo XLSX novo de
 volumes DENATRAN: lê o arquivo, casa colunas com staging.bronze_{ano} pelo
 nome (nunca hardcoded), insere no MotherDuck, sobe cópia em Parquet pro S3
-(dual-write até decidirmos a estratégia final de bronze), e oferece um botão
-separado pra rodar Silver + Gold — não dispara sozinho a cada upload, porque
-reprocessar tudo é caro/demorado (mesma preocupação de custo do resto do app).
+(dual-write até decidirmos a estratégia final de bronze), e reconstrói
+Silver + Gold — tudo como uma pipeline única, obrigatória, sem botão manual
+separado. Antes o rebuild era um passo manual (pra evitar reprocessar toda
+hora), mas como arquivo novo chega poucas vezes por mês, o custo de sempre
+rodar é baixo, e um passo manual esquecido deixa o Gold desatualizado sem
+nenhum aviso — pior que sempre reconstruir.
+
+A tela mostra a pipeline em etapas nomeadas (estilo Airflow/CI), cada uma
+com o nome da função/script por trás, pra facilitar debug futuro: dá pra
+ver exatamente em qual etapa algo quebrou sem precisar ler o traceback
+inteiro pra entender o contexto.
 
 Achado importante: read_xlsx(..., all_varchar=true) transforma data em número
 de série do Excel (ex: '21915'), não texto legível — por isso a leitura NÃO
@@ -15,12 +23,12 @@ Achado em produção (2026-08-11): um upload de teste quebrou no passo do S3
 (secret AWS não configurado na Streamlit Cloud) DEPOIS que o INSERT no
 MotherDuck já tinha rodado com sucesso — deixou staging.bronze_1958 com 30
 linhas órfãs, sem cópia no S3 e sem nada impedindo reenviar o mesmo arquivo e
-duplicar. Por isso agora: (1) o hash do arquivo é registrado em
-app.upload_log logo após o INSERT no MotherDuck ter sucesso — não só depois
-do S3 completar — pra uma falha de S3 não deixar uma reexecução vulnerável a
-duplicar linhas; (2) falha no S3 é capturada (não derruba a página inteira) e
-fica visível no log como s3_ok=False, pra dar pra saber depois quais anos
-ainda precisam da cópia.
+duplicar. Por isso: (1) o hash do arquivo é registrado em app.upload_log logo
+após o INSERT no MotherDuck ter sucesso — não só depois do S3 completar — pra
+uma falha de S3 não deixar uma reexecução vulnerável a duplicar linhas; (2)
+falha no S3 é capturada (não derruba a pipeline inteira) e fica visível no
+log como s3_ok=False, pra dar pra saber depois quais anos ainda precisam da
+cópia.
 """
 
 import hashlib
@@ -35,7 +43,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import boto3
 import streamlit as st
 
+from gold.build_volumes import main as build_gold
 from silver.db.connection import get_connection
+from silver.normalizers.denatran import normalize_denatran
 
 st.set_page_config(page_title="Klume — Upload de Dados", page_icon="📥")
 
@@ -43,8 +53,8 @@ os.environ["MOTHERDUCK_TOKEN"] = st.secrets["MOTHERDUCK_TOKEN"]
 
 st.title("Upload de Dados — Volumes DENATRAN")
 st.caption(
-    "Página operacional: sobe um arquivo XLSX novo pro Bronze (MotherDuck + S3). "
-    "Não atualiza Silver/Gold automaticamente — isso é um passo separado, explícito."
+    "Página operacional: sobe um arquivo XLSX novo pro Bronze (MotherDuck + S3) "
+    "e reconstrói Silver + Gold automaticamente, em pipeline."
 )
 
 DATE_COL = "Data de Emplacamento"
@@ -118,17 +128,29 @@ if uploaded is not None:
     file_bytes = uploaded.getvalue()
     hash_ = file_hash(file_bytes)
 
-    previous = find_previous_uploads(con, hash_)
-    if previous:
-        st.error(
-            "Esse arquivo (mesmo conteúdo, mesmo hash) já foi enviado antes — upload "
-            "bloqueado pra não duplicar linhas no Bronze."
-        )
-        for ts, filename, ano, rows_inserted, s3_ok in previous:
-            st.write(
-                f"- {ts:%Y-%m-%d %H:%M} UTC — `{filename}` — ano {ano} — "
-                f"{rows_inserted:,} linhas — cópia S3: {'ok' if s3_ok else 'PENDENTE/falhou'}"
+    st.subheader("Pipeline")
+
+    # --- Etapa 1: duplicata ---------------------------------------------
+    blocked = False
+    with st.status("1. Verificação de duplicata — `app.upload_log`", expanded=True) as status:
+        previous = find_previous_uploads(con, hash_)
+        if previous:
+            st.error(
+                "Esse arquivo (mesmo conteúdo, mesmo hash) já foi enviado antes — "
+                "upload bloqueado pra não duplicar linhas no Bronze."
             )
+            for ts, filename, ano, rows_inserted, s3_ok in previous:
+                st.write(
+                    f"- {ts:%Y-%m-%d %H:%M} UTC — `{filename}` — ano {ano} — "
+                    f"{rows_inserted:,} linhas — cópia S3: {'ok' if s3_ok else 'PENDENTE/falhou'}"
+                )
+            status.update(label="1. Verificação de duplicata — BLOQUEADO", state="error")
+            blocked = True
+        else:
+            st.write("Hash novo — sem duplicata encontrada.")
+            status.update(label="1. Verificação de duplicata — OK", state="complete")
+
+    if blocked:
         st.stop()
 
     con.execute("INSTALL excel")
@@ -139,29 +161,41 @@ if uploaded is not None:
         tmp_path = tmp.name
 
     try:
-        # Sem all_varchar: deixa a coluna de data ser inferida como DATE de verdade
-        # (com all_varchar ela vira número de série do Excel, tipo '21915').
-        src_cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_xlsx('{tmp_path}')").fetchall()]
+        # --- Etapa 2: leitura do XLSX ------------------------------------
+        with st.status("2. Leitura do arquivo — `read_xlsx()`", expanded=True) as status:
+            # Sem all_varchar: deixa a coluna de data ser inferida como DATE de
+            # verdade (com all_varchar ela vira número de série do Excel, tipo '21915').
+            src_cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_xlsx('{tmp_path}')").fetchall()]
+            st.write(f"{len(src_cols)} colunas encontradas no arquivo.")
+            status.update(label="2. Leitura do arquivo — OK", state="complete")
 
-        # Schema validation: compara contra o schema de referência (ano "normal",
-        # 45 colunas) antes de tocar em qualquer tabela — arquivo no formato errado
-        # é rejeitado aqui, não silenciosamente aceito com colunas faltando viram NULL.
-        reference_cols = [r[0] for r in con.execute(f"DESCRIBE staging.{SCHEMA_TEMPLATE_YEAR}").fetchall()]
-        missing_required = [c for c in REQUIRED_COLUMNS if c not in src_cols]
-        match_rate = sum(1 for c in reference_cols if c in src_cols) / len(reference_cols)
+        # --- Etapa 3: validação de schema --------------------------------
+        rejected = False
+        with st.status("3. Validação de schema — `REQUIRED_COLUMNS` / `MIN_MATCH_RATE`", expanded=True) as status:
+            reference_cols = [r[0] for r in con.execute(f"DESCRIBE staging.{SCHEMA_TEMPLATE_YEAR}").fetchall()]
+            missing_required = [c for c in REQUIRED_COLUMNS if c not in src_cols]
+            match_rate = sum(1 for c in reference_cols if c in src_cols) / len(reference_cols)
+            st.write(f"Match contra o schema de referência ({SCHEMA_TEMPLATE_YEAR}): {match_rate:.0%}")
 
-        if missing_required:
-            st.error(
-                f"Arquivo rejeitado: faltam colunas obrigatórias {missing_required}. "
-                "Não parece ser um export de volumes DENATRAN."
-            )
-            st.stop()
-        if match_rate < MIN_MATCH_RATE:
-            st.error(
-                f"Arquivo rejeitado: bate com apenas {match_rate:.0%} das colunas do "
-                f"formato DENATRAN esperado (mínimo {MIN_MATCH_RATE:.0%}). Confira se é "
-                "o arquivo certo."
-            )
+            if missing_required:
+                st.error(
+                    f"Arquivo rejeitado: faltam colunas obrigatórias {missing_required}. "
+                    "Não parece ser um export de volumes DENATRAN."
+                )
+                status.update(label="3. Validação de schema — REJEITADO (colunas faltando)", state="error")
+                rejected = True
+            elif match_rate < MIN_MATCH_RATE:
+                st.error(
+                    f"Arquivo rejeitado: bate com apenas {match_rate:.0%} das colunas do "
+                    f"formato DENATRAN esperado (mínimo {MIN_MATCH_RATE:.0%}). Confira se é "
+                    "o arquivo certo."
+                )
+                status.update(label="3. Validação de schema — REJEITADO (match baixo)", state="error")
+                rejected = True
+            else:
+                status.update(label="3. Validação de schema — OK", state="complete")
+
+        if rejected:
             st.stop()
 
         anos = con.execute(f"""
@@ -174,21 +208,24 @@ if uploaded is not None:
 
         if not anos:
             st.error(f"Não encontrei nenhuma data válida na coluna '{DATE_COL}'.")
-        else:
-            if len(anos) > 1:
-                st.warning(f"O arquivo cobre mais de um ano: {anos}. Processando cada um separadamente.")
+            st.stop()
 
-            for ano in anos:
-                st.subheader(f"Ano {ano}")
-                target_table = f"staging.bronze_{ano}"
+        if len(anos) > 1:
+            st.warning(f"O arquivo cobre mais de um ano: {anos}. Processando cada um separadamente.")
 
+        for ano in anos:
+            st.markdown(f"#### Ano {ano}")
+            target_table = f"staging.bronze_{ano}"
+
+            # --- Etapa Bronze -------------------------------------------
+            with st.status(f"4. Ano {ano} — Bronze: preparar e inserir em `{target_table}`", expanded=True) as status:
                 exists = con.execute(f"""
                     SELECT COUNT(*) FROM information_schema.tables
                     WHERE table_schema = 'staging' AND table_name = 'bronze_{ano}'
                 """).fetchone()[0] > 0
 
                 if not exists:
-                    st.info(f"{target_table} não existe ainda — criando com o schema de staging.{SCHEMA_TEMPLATE_YEAR}.")
+                    st.write(f"{target_table} não existe ainda — criando com o schema de staging.{SCHEMA_TEMPLATE_YEAR}.")
                     con.execute(f"CREATE TABLE {target_table} AS SELECT * FROM staging.{SCHEMA_TEMPLATE_YEAR} LIMIT 0")
 
                 tgt_cols = [r[0] for r in con.execute(f"DESCRIBE {target_table}").fetchall()]
@@ -226,17 +263,16 @@ if uploaded is not None:
                 con.execute(f"INSERT INTO {target_table} SELECT * FROM {staged_view}")
                 n_after = con.execute(f"SELECT COUNT(*) FROM {target_table}").fetchone()[0]
                 n_inserted = n_after - n_before
-                st.success(f"{n_inserted:,} linhas inseridas em {target_table} (total agora: {n_after:,}).")
+                st.write(f"{n_inserted:,} linhas inseridas em {target_table} (total agora: {n_after:,}).")
 
                 # Registra o hash JÁ AQUI, logo após o INSERT ter sucesso — não só
                 # depois do S3 completar. Se o S3 falhar embaixo, uma reexecução
                 # ainda vai ser barrada como duplicata em vez de duplicar linhas.
                 log_insert(con, filename=uploaded.name, hash_=hash_, ano=ano, rows_inserted=n_inserted)
+                status.update(label=f"4. Ano {ano} — Bronze — OK ({n_inserted:,} linhas)", state="complete")
 
-                # Dual-write pro S3 — mesmas linhas que acabaram de entrar no MotherDuck,
-                # não um dump bruto do xlsx original (uma fonte de verdade só pro que "essa
-                # subida" produziu). Falha aqui não derruba a página: já está tudo
-                # registrado no MotherDuck e no log, só a cópia S3 fica pendente.
+            # --- Etapa S3 (não-fatal) ------------------------------------
+            with st.status(f"5. Ano {ano} — S3: dual-write (`denatran-bronze/{ano}/`)", expanded=True) as status:
                 try:
                     meses = con.execute(f"""
                         SELECT DISTINCT strftime(CAST(strptime("{DATE_COL}", '%Y%m%d') AS DATE), '%Y%m')
@@ -255,33 +291,17 @@ if uploaded is not None:
                         key = f"{S3_PREFIX}/{ano}/{mes}/{uploaded.name}.parquet"
                         s3.upload_file(str(local_parquet), bucket, key)
                         local_parquet.unlink()
-                        st.success(f"Cópia enviada pro S3: s3://{bucket}/{key}")
+                        st.write(f"Cópia enviada: s3://{bucket}/{key}")
                     mark_s3_ok(con, hash_=hash_, ano=ano)
+                    status.update(label=f"5. Ano {ano} — S3 — OK", state="complete")
                 except Exception as e:
-                    st.error(
-                        f"Falha ao subir a cópia pro S3 do ano {ano} (dados já estão no "
-                        f"MotherDuck, isso só afeta o backup): {e}"
-                    )
-    finally:
-        os.unlink(tmp_path)
+                    # Não-fatal: dados já estão no MotherDuck, só o backup fica pendente.
+                    st.error(f"Falha no S3 (dados já estão no MotherDuck, isso só afeta o backup): {e}")
+                    status.update(label=f"5. Ano {ano} — S3 — FALHOU (backup pendente)", state="error")
 
-    st.divider()
-    st.subheader("Próximo passo")
-    st.write(
-        "O upload só afeta o Bronze. Silver e Gold ainda não foram atualizados "
-        "— clique abaixo quando quiser (pode demorar, reprocessa os dados)."
-    )
-    if st.button("Atualizar Silver e Gold"):
-        with st.spinner("Reprocessando o(s) ano(s) afetado(s) e reconstruindo o Gold..."):
-            from gold.build_volumes import main as build_gold
-            from silver.normalizers.denatran import normalize_denatran
-
-            con = get_connection("motherduck")
-            for ano in anos:
-                # Reprocessa só o ano afetado a partir do bronze e faz MERGE em
-                # silver.veiculos/historico (delete + insert) — nunca substitui a
-                # tabela inteira, que já acumula outros anos (2016/2020/2025/etc).
-                recent, historico = normalize_denatran(con, f"staging.bronze_{ano}", stage_prefix=f"upl{ano}")
+            # --- Etapa Silver ---------------------------------------------
+            with st.status(f"6. Ano {ano} — Silver: `normalize_denatran()` + merge", expanded=True) as status:
+                recent, historico = normalize_denatran(con, target_table, stage_prefix=f"upl{ano}")
 
                 con.execute(f"DELETE FROM silver.veiculos WHERE date_part('year', data_emplacamento) = {ano}")
                 con.execute(f"INSERT INTO silver.veiculos SELECT * FROM {recent}")
@@ -289,5 +309,13 @@ if uploaded is not None:
                 con.execute(f"DELETE FROM silver.veiculos_historico WHERE date_part('year', data_emplacamento) = {ano}")
                 con.execute(f"INSERT INTO silver.veiculos_historico SELECT * FROM {historico}")
 
+                status.update(label=f"6. Ano {ano} — Silver — OK", state="complete")
+
+        # --- Etapa Gold (uma vez, cobre todos os anos afetados) -----------
+        with st.status("7. Reconstruir Gold — `gold/build_volumes.py::main()`", expanded=True) as status:
             build_gold()
-        st.success("Silver e Gold atualizados.")
+            status.update(label="7. Reconstruir Gold — OK", state="complete")
+
+        st.success(f"Pipeline concluída — Bronze, Silver e Gold atualizados pra {anos}.")
+    finally:
+        os.unlink(tmp_path)
