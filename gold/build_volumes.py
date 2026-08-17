@@ -310,10 +310,16 @@ def main():
     assert n_pre == n_base, "Join da fato perdeu ou duplicou linhas — dimensão incompleta."
     print("OK: nenhuma linha perdida/duplicada no join da fato.")
 
-    total = con.execute("SELECT SUM(quantidade) FROM gold.fato_volumes").fetchone()[0]
-    print(f"SUM(quantidade) na view: {total:,}")
-    assert total == 10_658_607, f"SUM(quantidade) diferente do esperado: {total}"
-    print("OK: SUM(quantidade) bate com o valor conhecido.")
+    total_gold = con.execute("SELECT SUM(quantidade) FROM gold.fato_volumes").fetchone()[0]
+    total_silver = con.execute("SELECT SUM(quantidade) FROM silver.veiculos").fetchone()[0]
+    print(f"SUM(quantidade) — silver.veiculos: {total_silver:,} | gold.fato_volumes: {total_gold:,}")
+    # Invariante relativa (conservação de volume), não um total fixo — um total fixo
+    # quebra garantido a cada upload novo, já que a soma muda por design.
+    assert total_gold == total_silver, (
+        f"SUM(quantidade) do Gold ({total_gold:,}) diferente do Silver ({total_silver:,}) "
+        "— o build perdeu ou inflou volume."
+    )
+    print("OK: SUM(quantidade) do Gold bate com o Silver (nenhum volume perdido/inflado).")
 
     for tbl, key in [
         ("dim_veiculo_observado", "veiculo_key"),
