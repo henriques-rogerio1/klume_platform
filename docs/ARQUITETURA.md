@@ -27,10 +27,13 @@ CNPJ Receita              tipado                fato + dims      Tableau/Power B
   `staging.bronze_master_estabelecimentos` (Estabelecimentos, com `nome_fantasia` e
   CNAE, 63,8M linhas) — já limpos, usados como referência externa (não duplicados no
   Silver/Gold).
-- **FIPE**: ainda não ingerido no MotherDuck. Dado real e atual existe localmente
-  (`Documents/fipe_api/jsons/{Cars,Bikes,Trucks}/*_sample_*.json`) — pipeline própria
-  (repo separado `fipe_api`, orquestrada por Mage AI) nunca populou
-  `staging.raw_json_fipe` nesta instância. **Deliberadamente fora de escopo** até agora.
+- **FIPE**: `staging.raw_json_fipe` (2026-08-24), populado por um bulk loader
+  próprio a partir dos CSVs já extraídos em
+  `s3://klume-volumes-s3-platform/Fipe_Csv/` (~354 mil linhas, Cars/Bikes/Trucks,
+  ~11 meses de histórico) — não pelo script linha-a-linha do repo separado
+  `fipe_api` (levaria horas pra esse volume). `fipe_api` (orquestrado por Mage AI)
+  continua sendo a fonte de verdade pra *chamar* a API FIPE; só a ingestão pro
+  MotherDuck foi refeita aqui.
 
 ## Silver
 
@@ -121,6 +124,68 @@ Solução: duas dimensões, dois propósitos, nenhuma inventando uma linha do te
 - Atributos de cardinalidade trivial (`cor_predominante`=18, `tipo_venda`=3,
   `match_tier`=2) ficam **inline na fato** — DuckDB/Parquet já comprime string de
   baixa cardinalidade bem, uma dimensão separada só adicionaria join sem ganho real.
+- **`gold.dim_empresa`** (2026-08-20) — enriquecimento de `cnpj_basico_faturado`
+  (razão social, CNAE, `categoria_empresa`). Escopo deliberadamente restrito aos
+  ~8.455 CNPJs que já aparecem em `silver.veiculos` — não os ~65M CNPJs da Receita
+  Federal inteira. Fonte: `staging.bronze_master_cnpj` + `main.CNPJ_empresas_final`
+  (mesma base "Empresas", schema idêntico, **zero sobreposição verificada** entre
+  as duas — juntas cobrem 99,98% dos CNPJs relevantes, nenhuma sozinha passa de
+  75%) + linha matriz de `staging.bronze_master_estabelecimentos` (CNAE, cobre
+  96,6%). `categoria_empresa` classifica por CNAE: `45xx` = concessionária/comércio
+  de veículos (54% do volume faturado por CNPJ), `771x` = locadora (deliberadamente
+  mais estreito que `77xx` inteiro, que também pegaria aluguel de máquinas sem
+  relação com veículo). Duas sentinelas em `empresa_key` (não em `cnpj_basico` —
+  `'00000000'` é um CNPJ real, Banco do Brasil, então não pode virar sentinela):
+  `-1` = venda não faturada por CNPJ, `-2` = CNPJ real sem correspondência em
+  nenhuma fonte Empresas. **Refresh é manual, desacoplado do pipeline automático de
+  upload** (`python gold/build_dim_empresa.py`) — evita escanear ~104M linhas de
+  CNPJ a cada arquivo novo de volumes; `gold/build_volumes.py::main()` só constrói
+  `dim_empresa` automaticamente na primeira vez (bootstrap), depois disso CNPJ novo
+  fica com a sentinela `-2` até o próximo refresh manual.
+- **Preço FIPE em `gold.dim_veiculo_atual`** (2026-08-24) — `codigo_fipe`,
+  `preco_fipe`, `match_tier_fipe`, `data_referencia_fipe`, mesmo grão Type 1 já
+  usado por `segmentacao_klume` (propriedade estável do `vehicle_key`, não da
+  venda). Fonte: `silver.fipe_precos` (normalizador novo,
+  `silver/normalizers/fipe.py`, populado a partir dos CSVs já extraídos em
+  `s3://klume-volumes-s3-platform/Fipe_Csv/`, ~546 mil linhas, grão
+  `codigo_fipe × year_code × reference_month` — histórico completo mantido,
+  não colapsado, porque módulos futuros de TCO/Preço Transacionado vão
+  precisar de trajetória de preço). Três tiers, ativando um conceito que já
+  existia documentado desde sempre mas nunca tinha código (`match_tier`
+  aparecia em `fato_volumes_base` sem nenhuma linha marcada tier 2):
+  - **Tier 1** (na própria fato, não aqui): código FIPE que já vinha embutido
+    na linha de origem do DENATRAN — inalterado, ver `fato_volumes_base`
+    abaixo.
+  - **Tier 2** (novo): hash canônico via `canonical_str_fipe_sql`
+    (`silver/vehicle_key/canonical_sql.py`) — mesmo domínio de hash do
+    `vehicle_key` de DENATRAN, com um alias de marca pequeno e curado à mão
+    (`silver/vehicle_key/marca_alias_fipe.py`: GM/Chevrolet, VW/Volkswagen,
+    M Benz/Mercedes Benz, Chery/Caoa Chery, Kia/Kia Motors — nunca fuzzy
+    match, e nunca altera o `vehicle_key` real de DENATRAN). **Yield real é
+    baixo** (457 de ~30 mil `vehicle_key`, ~8% do volume) porque o campo
+    `versao` do DENATRAN não carrega cilindrada (principal atributo
+    distintivo do lado FIPE) e as abreviações não alinham token a token
+    (`"TORO FREEDOM AT9"` vs. `"Toro Freedom 2.0 16V 4x2 TB Diesel Mec."`) —
+    confirmado por comparação direta, não é bug de normalização de texto.
+    Decidido não construir uma tabela de tradução de abreviação por marca pra
+    fechar esse gap: risco real de atribuir preço do trim errado
+    silenciosamente, e o tier 3 abaixo já resolve essa classe de problema
+    melhor (ver `docs/architecture-roadmap.md` item B2 pro raciocínio
+    completo).
+  - **Tier 3**: o crosswalk manual pré-existente (`silver.mapping_table`),
+    com dois bugs corrigidos nesta rodada — descartava o código que acabara
+    de casar (`SELECT * EXCLUDE(...)`, guardava só o flag) e tratava strings
+    de anotação (`'NE'`, `'A'`, `'ND'`, `'ver'`) como match válido. Corrigir
+    os dois removeu 54.771 falsos-positivos (2.857.766 → 2.802.995 linhas).
+    Continua sendo o tier de maior cobertura real (44% do volume) — curadoria
+    humana lida melhor com a divergência de vocabulário do que o hash exato.
+  - Tier 2 tem precedência sobre tier 3 quando ambos casam. `NULL` = nenhum
+    dos dois achou (~47% do volume hoje).
+  - Construído dentro do mesmo `CREATE OR REPLACE` de `dim_veiculo_atual`
+    (não é refresh desacoplado como `dim_empresa`) — `silver.fipe_precos` é
+    pequeno o bastante (~546 mil linhas) pra reconstruir a cada upload
+    automático, e uma segunda passada separada seria apagada no próximo
+    rebuild de qualquer forma.
 
 ### `gold.fato_volumes_base` (fato física) + `gold.fato_volumes` (view)
 
@@ -194,9 +259,23 @@ Duas superfícies diferentes pro mesmo Gold, não um mecanismo só:
   MotherDuck — armazenamento perto do limite do plano gratuito.
   `normalize_denatran()` já aceita `read_parquet('s3://...')` como fonte, sem mudança
   de código.
-- **`silver.fipe_precos`** — normalizador FIPE ainda não existe (fonte local em JSON
-  já mapeada, ver `Bronze` acima).
-- **Join preço × volume no Gold** — depende do item acima.
+- **Join preço FIPE × volume — feito** (`gold.dim_veiculo_atual`, 2026-08-24, ver
+  seção "Demais dimensões"). Pendências restantes: tier 2 tem yield baixo em
+  carros por divergência de vocabulário DENATRAN/FIPE (decidido não corrigir
+  automaticamente, ver seção acima); limite de retenção pra
+  `silver.fipe_precos` ainda não definido (decisão de negócio, só anotada);
+  sem `gold.dim_fipe` — sem consumidor de trajetória de preço até TCO/Preço
+  Transacionado existirem.
+- **Join CNPJ × volume — feito** (`gold.dim_empresa`, 2026-08-20, ver seção "Demais
+  dimensões"). Pendências restantes desse item: as 3 tabelas brutas de CNPJ
+  (`bronze_master_cnpj`, `CNPJ_empresas_final`, `bronze_master_estabelecimentos`)
+  continuam residentes no MotherDuck só pra viabilizar refresh futuro de
+  `dim_empresa` — candidatas a migrar pro S3 (mesmo padrão do bronze de volumes),
+  ainda não decidido. Também: `staging.fipe_2024/2023/2022` (100% vazias, tentativa
+  abandonada de FIPE), `ADHOC_FILES.CNPJ_Empresas` e `staging.estab_y0` (dumps
+  brutos já superados pelas versões parseadas) e
+  `gold.fato_volumes_snapshot_pre_star` (backup antigo, já testado exaustivamente)
+  são candidatas seguras a apagar já — nenhuma ainda foi removida.
 - **`gold.semantic_dictionary`** — tabela de ontologia mais rica que
   `COMMENT ON COLUMN` (definição de negócio, exemplos, owner) — ideia registrada,
   não construída.
@@ -205,11 +284,10 @@ Duas superfícies diferentes pro mesmo Gold, não um mecanismo só:
   Deve reconstruir `veiculo_atual_key` de qualquer forma se essa migração
   reprocessar dados.
 - **MCP pra clientes externos** — não iniciado.
-- **Secrets AWS não configurados na Streamlit Community Cloud** — só existem no
-  `.streamlit/secrets.toml` local (gitignored). Passo manual pendente: colar
-  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION`/`S3_BUCKET` na UI de
-  "Secrets" do app publicado, senão o dual-write pro S3 continua falhando em
-  produção (o MotherDuck é gravado normalmente; só a cópia S3 fica pendente).
+- **Ingestão automática via Gmail/Drive** — planejada e aprovada, mas deliberadamente
+  adiada (2026-08-17): `docs/architecture-roadmap.md` item D2 já recomendava manter
+  intake manual até virar gargalo de verdade. Plano completo continua salvo, pronto
+  pra retomar se isso mudar.
 - **4 databases MotherDuck órfãos** (`bronze`, `silver`, `gold`, `my_db`, de
   fevereiro, quase vazios, sem relação com os schemas reais dentro de
   `Klume_DB_Cloud`) — seguros de apagar, ainda não confirmado com o usuário.

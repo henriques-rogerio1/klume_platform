@@ -83,7 +83,7 @@ one developer remembers to run it against.
 
 ## B. Near-term product modules (cheapest, closest to shippable)
 
-### B1. Locadoras module — CNPJ join + CNAE classification
+### B1. Locadoras module — CNPJ join + CNAE classification — **Done (2026-08-20)**
 
 **Problem/Opportunity**: `fato_volumes_base.cnpj_basico_faturado` already
 exists, and Receita Federal CNPJ reference data is already sitting in Bronze
@@ -92,59 +92,111 @@ exists, and Receita Federal CNPJ reference data is already sitting in Bronze
 (`docs/ARQUITETURA.md` lines 26-29). This is not a new data source; it's a join
 against data already on hand.
 
-**Decision**: build a `dim_empresa`-style enrichment (or a dedicated view) that
-joins `cnpj_basico_faturado` against the Bronze CNPJ tables, and classify which
-CNPJs count as locadoras via CNAE code.
+**Shipped**: `gold.dim_empresa` (`gold/build_dim_empresa.py`) — scoped to the
+~8,455 CNPJs actually observed in `silver.veiculos`, sourced from
+`staging.bronze_master_cnpj` **and** a second, previously-undocumented reference
+table `main.CNPJ_empresas_final` found during this work (zero row overlap between
+the two, confirmed by direct query — together they cover 99.98% of relevant CNPJs
+vs. ~75% from either alone). CNAE from `staging.bronze_master_estabelecimentos`
+(matriz row, 96.6% coverage). Wired into `gold.fato_volumes_base`/`gold.fato_volumes`
+additively (`empresa_key`, `razao_social`, `categoria_empresa`). Full design in
+`docs/ARQUITETURA.md`'s "Demais dimensões" section.
 
-**Reasoning**: near-zero new ingestion cost, already produces useful analytics
-per this session's discussion, and validates "CNPJ as an identity key" before
-it's needed elsewhere (e.g. TCO's B2B/B2C segmentation).
+**CNAE boundary — resolved**: `categoria_empresa` = `'Concessionária/Comércio de
+Veículos'` for CNAE `45xx` (54% of CNPJ-invoiced volume — dealers invoicing
+retail sales dominate, not fleet/rental companies), `'Locadora'` for CNAE `771x`
+(aluguel de meios de transporte — deliberately narrower than `77xx`, which also
+sweeps in unrelated equipment-rental CNAE groups), else `'Outro'`. Confirmed
+2026-08-20; **not yet propagated** to the existing `CNAE LIKE '7711%'` assumption
+already hardcoded in `app/training_data.py`'s Vanna example — that's a deliberate,
+separate follow-up, gated on seeing this classification hold up in production use.
 
-**Open item**: confirm which CNAE code(s) define "locadora" for classification
-purposes — a business definition, not a technical one.
+**Deferred, tracked separately**: refresh of `dim_empresa` is manual/decoupled
+from the automatic upload pipeline (scanning ~104M raw CNPJ rows on every small
+upload wasn't worth it); the 3 raw CNPJ reference tables stay resident in
+MotherDuck to support that refresh — archiving them to S3 (same pattern as
+DENATRAN bronze) is a real, still-open storage question, not resolved here.
 
-### B2. FIPE integration
+### B2. FIPE integration — **Done (2026-08-24)**
 
 **Problem/Opportunity**: two roadmap modules (Custo Estratégico Operacional's
 depreciation calc, Preço Transacionado's reference pricing) need FIPE data.
-FIPE ingestion exists as a separate, already-working pipeline
-(`fipe_api` repo, orchestrated by Mage AI — handles calling and testing the FIPE
-API) but has never populated MotherDuck (`docs/ARQUITETURA.md` lines 30-33,
-"deliberately out of scope until now").
+`match_tier` already existed in `fato_volumes_base`, anticipating this, but was
+never completed — `staging.raw_json_fipe` didn't exist, and nothing in Silver
+reached Gold.
 
-**Decision**:
-- Do **not** rebuild the FIPE-calling logic — Mage AI already solves the hard
-  part (API calls, testing). Bridge its output into `staging.bronze_fipe` in
-  MotherDuck instead of reimplementing ingestion.
-- Join FIPE data onto the vehicle dimension via a **compound/tiered match**,
-  not a strict equality join: marca+modelo is a reliable match key, versão is
-  best-effort (FIPE doesn't cover every DENATRAN trim variant).
-- Extend the existing `match_tier` column (already present in
-  `fato_volumes_base`, already documented as anticipating exactly this) to:
-  - `1` = FIPE code came directly from the DENATRAN source row (existing
-    semantics)
-  - `2` = matched via marca+modelo+versão
-  - `3` = matched via marca+modelo only, versão unresolved
-  - `NULL` = no match found
-- Keep FIPE price/code nullable downstream everywhere rather than dropping
-  unmatched rows — "no match" is expected (e.g. brand-new models), not an
-  error state.
+**Shipped**: `staging.raw_json_fipe` populated from the already-extracted S3
+CSVs (`s3://klume-volumes-s3-platform/Fipe_Csv/`, ~546K rows across ~11 months
+of history) — not from the `fipe_api` repo's row-at-a-time MotherDuck script,
+which would have taken hours; a bulk loader was written instead.
+`silver/normalizers/fipe.py` → `silver.fipe_precos` (grain = `codigo_fipe ×
+year_code × reference_month`, full history kept, not collapsed to latest —
+future TCO/Preço Transacionado modules need trajectories, not a snapshot; see
+retention TODO below). `vehicle_key` computed via a new
+`canonical_str_fipe_sql` macro (`silver/vehicle_key/canonical_sql.py`) — same
+hash domain as DENATRAN's `canonical_str_denatran_sql`, proven identical for
+matching vehicles by `test_canonical_sql_parity.py`.
 
-**Reasoning**: `match_tier`'s existing comment — *"Não existe preço FIPE
-disponível ainda nesta versão"* — shows this was already a deliberately left
-seam in the schema, not new scope. Reusing Mage AI's output avoids duplicating
-already-solved API integration work.
+**Match tiers — activated, not redefined** (the original plan above proposed
+redefining tier 2/3 as marca+modelo+versão / marca+modelo; rejected, since that
+would have changed the meaning of the 2.86M rows already marked tier 3):
+- `1` = FIPE code came directly from the DENATRAN source row — unchanged,
+  lives in `fato_volumes_base.fipe`/`.preco` (confirmed non-fragmenting:
+  0 groups with >1 distinct value).
+- `2` (new) = hash-canonical match against `silver.fipe_precos` via
+  `canonical_str_fipe_sql`, with a small hand-curated marca alias
+  (`silver/vehicle_key/marca_alias_fipe.py` — GM/Chevrolet, VW/Volkswagen,
+  M Benz/Mercedes Benz, Chery/Caoa Chery, Kia/Kia Motors; not fuzzy matching).
+  Never touches the real DENATRAN `vehicle_key`.
+- `3` = the pre-existing manual crosswalk (`silver.mapping_table`), with two
+  real bugs fixed: it was discarding the matched FIPE code (`SELECT *
+  EXCLUDE(...)`, kept only the boolean flag) and treating annotation strings
+  (`'NE'`, `'A'`, `'ND'`, `'ver'`) as valid matches. Fixing both dropped
+  54,771 false-positive tier-3 rows (2,857,766 → 2,802,995), verified via a
+  before/after row-count reconciliation.
+- Tier 2/3 are vehicle-grain properties → live in `gold.dim_veiculo_atual`
+  (`codigo_fipe`, `preco_fipe`, `match_tier_fipe`, `data_referencia_fipe`),
+  built in the same `CREATE OR REPLACE` as the rest of the table (not a
+  decoupled refresh like `dim_empresa` — `silver.fipe_precos` is small enough
+  to rescan every automatic Gold rebuild, and a separate pass would get wiped
+  by the next one anyway). Tier 2 always takes precedence over tier 3 when
+  both match.
 
-**Open item — verify before trusting the join**: "marca+modelo is a unique
-nationwide key" is true *within FIPE's own catalog*, but unverified as a
-cross-source match against DENATRAN's independently-sourced text. The exact
-same class of problem already hit DENATRAN-internally (combustível/tipo_veiculo
-spelling drifting by safra — "Moto" vs "MOTOCICLETA"). Before committing to a
-simple join:
-- Pull FIPE's distinct marca/modelo values and diff against DENATRAN's.
-- If they don't align cleanly, budget for a normalization/mapping layer in the
-  same spirit as `silver/vehicle_key/canonical.py`, rather than assuming a
-  clean join.
+**Marca alignment — verified, not assumed**: FIPE's ~218 distinct brand names
+vs. DENATRAN's ~1,354 (duplicate spellings + a long tail of trailers/
+motorcycles/heavy equipment) do NOT align cleanly on raw text — confirmed by
+anti-join in both directions before building the join, which is what produced
+the marca alias table above. 146 marcas now align.
+
+**Known limitation — tier 2's real yield is low, and it's not a text-
+normalization problem**: after shipping, checking the actual
+`match_tier_fipe` distribution showed tier 2 only covers 457 of ~30,272
+`vehicle_key`s (892K of 10.66M volume, ~8%) — and major brands (Honda, VW,
+Fiat, Ford, Toyota, Hyundai, Volvo, Nissan) show **zero** tier 2 *or* tier 3
+match despite FIPE covering them well. Root cause, confirmed by direct
+comparison (e.g. FIAT TORO 2017): DENATRAN's `versao` field for cars doesn't
+carry engine displacement at all (FIPE's primary distinguishing spec), and
+abbreviations don't align token-for-token — DENATRAN's `"TORO FREEDOM AT9"`
+vs. FIPE's `"Toro Freedom 2.0 16V 4x2 TB Diesel Mec."`. Closing this gap would
+need a hand-curated abbreviation-translation table per brand (`AT`→`Aut.`,
+`D`→`Diesel`, `T270`→turbo code, etc.) with real risk of silently assigning
+the wrong trim's price — **decided not to build this**: tier 3's human-curated
+crosswalk already solves exactly this class of problem better (44% of volume
+vs. tier 2's 8%), so a fragile automated trim-matcher would be competing with,
+not complementing, a better-performing existing solution. Tier 2 stays as
+implemented — an exact hash match that fires reliably for simpler cases
+(e.g. motorcycles, where naming conventions align better) and costs nothing
+when it doesn't fire (`NULL`, not a wrong answer). ~53% of volume has some
+FIPE price (tier 1+2+3 combined) as of 2026-08-24; the remaining ~47% is
+expected to shrink over time as tier 3's manual crosswalk grows, not via
+further tier 2 automation.
+
+**Deferred, tracked separately**: `silver.fipe_precos` keeps unbounded full
+price history — a retention limit (e.g. only last N years) will eventually be
+needed as more months accumulate from S3, but the limit itself is a business
+decision not yet made; not implemented per explicit instruction. No
+`gold.dim_fipe` yet — no consumer for price trajectory in Gold until TCO/Preço
+Transacionado are built.
 
 ---
 

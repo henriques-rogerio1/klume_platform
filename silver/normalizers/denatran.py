@@ -141,6 +141,14 @@ def _add_canonical_and_match_tier(
     # Tier 3: crosswalk manual (silver.mapping_table) — best-effort, dados com
     # sujeira conhecida na coluna "Existente" (ver plano). Não sobrescreve
     # tier 1, só preenche quando a própria linha não trouxe FIPE.
+    #
+    # Corrigido 2026-08-24 (achado ao planejar o enriquecimento FIPE): antes,
+    # o código que casava era descartado (só o flag match_tier=3 sobrevivia,
+    # sem o código em si pra usar depois) e o filtro NOT IN ('0','-','')
+    # deixava strings de anotação ("NE", "A", "ND", "ver") passarem como se
+    # fossem código válido. Agora persiste o código como
+    # codigo_fipe_crosswalk e só aceita valor no formato real de código FIPE
+    # (6 dígitos, hífen, 1 dígito).
     con.execute(f"""
         CREATE OR REPLACE VIEW {out_view}_mapped AS
         SELECT b.*, m."FIPE Carros Com Leves" AS fipe_tabela_polo
@@ -153,8 +161,13 @@ def _add_canonical_and_match_tier(
         SELECT
             * EXCLUDE (match_tier_raw, fipe_tabela_polo),
             CASE
+                WHEN regexp_matches(trim(fipe_tabela_polo), '^[0-9]{{6}}-[0-9]$')
+                THEN trim(fipe_tabela_polo)
+                ELSE NULL
+            END AS codigo_fipe_crosswalk,
+            CASE
                 WHEN match_tier_raw = 1 THEN 1
-                WHEN fipe_tabela_polo IS NOT NULL AND fipe_tabela_polo NOT IN ('0', '-', '') THEN 3
+                WHEN regexp_matches(trim(fipe_tabela_polo), '^[0-9]{{6}}-[0-9]$') THEN 3
                 ELSE NULL
             END AS match_tier
         FROM {out_view}_mapped

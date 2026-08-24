@@ -78,3 +78,20 @@ def test_sql_macro_matches_python_for_known_tricky_cases(con):
             "SELECT canonical_str_denatran_sql(?, ?, ?, ?)", [marca, versao, ano, comb]
         ).fetchone()[0]
         assert py_result == sql_result, f"{marca}/{versao}: python={py_result!r} sql={sql_result!r}"
+
+
+def test_fipe_sql_macro_matches_python(con):
+    # canonical_str_fipe_sql espelha canonical_str(..., source="fipe") --
+    # já provado em test_canonical.py::test_denatran_fipe_same_key que essa
+    # variante produz a mesma chave que a de DENATRAN pro mesmo veículo.
+    cases = [
+        ("Honda", "CG 160 Fan", 2026, "Gasolina"),
+        ("Acura", "Integra GS 1.8", 1992, "Gasolina"),
+        ("Fiat", "Argo 1.0", 2024, "Alcool/Gasolina"),
+    ]
+    for marca, modelo, ano, comb in cases:
+        py_result = canonical_str(marca, modelo, ano, comb, source="fipe")
+        sql_result = con.execute(
+            "SELECT canonical_str_fipe_sql(?, ?, ?, ?)", [marca, modelo, ano, comb]
+        ).fetchone()[0]
+        assert py_result == sql_result, f"{marca}/{modelo}: python={py_result!r} sql={sql_result!r}"

@@ -16,6 +16,7 @@ prova de que produzem o mesmo resultado.
 """
 
 from silver.vehicle_key.canonical import COMBUSTIVEL_MAP
+from silver.vehicle_key.marca_alias_fipe import MARCA_ALIAS_FIPE
 
 
 def _sql_quote(s: str) -> str:
@@ -26,6 +27,10 @@ def register_sql_macros(con) -> None:
     combustivel_case = "\n".join(
         f"                WHEN {_sql_quote(key)} THEN {_sql_quote(code)}"
         for key, code in COMBUSTIVEL_MAP.items()
+    )
+    marca_alias_case = "\n".join(
+        f"                WHEN {_sql_quote(key)} THEN {_sql_quote(value)}"
+        for key, value in MARCA_ALIAS_FIPE.items()
     )
 
     con.execute(r"""
@@ -68,6 +73,43 @@ def register_sql_macros(con) -> None:
     con.execute("""
         CREATE OR REPLACE MACRO canonical_str_denatran_sql(marca, versao, ano, comb) AS
             normalize_text_sql(marca) || '|' ||
+            normalize_text_sql(extract_modelo_denatran_sql(versao)) || '|' ||
+            COALESCE(trim(CAST(ano AS VARCHAR)), '0') || '|' ||
+            map_combustivel_sql(comb)
+    """)
+
+    # FIPE já vem com o campo "model" limpo, sem prefixo de marca -- não passa
+    # por extract_modelo_denatran_sql (que é específico do formato
+    # "MARCA/MODELO" que só o DENATRAN usa). Espelha exatamente
+    # canonical_str(..., source="fipe") do lado Python, já testado em
+    # test_canonical.py::test_denatran_fipe_same_key.
+    con.execute("""
+        CREATE OR REPLACE MACRO canonical_str_fipe_sql(marca, modelo, ano, comb) AS
+            normalize_text_sql(marca) || '|' ||
+            normalize_text_sql(modelo) || '|' ||
+            COALESCE(trim(CAST(ano AS VARCHAR)), '0') || '|' ||
+            map_combustivel_sql(comb)
+    """)
+
+    # Alias de marca só pra achar match de preço FIPE -- nunca usado no
+    # vehicle_key/canonical_str_denatran_sql em si, que continua igual.
+    # Ver silver/vehicle_key/marca_alias_fipe.py pro porquê de cada entrada.
+    con.execute(f"""
+        CREATE OR REPLACE MACRO marca_alias_fipe_sql(marca_normalizada) AS (
+            CASE marca_normalizada
+{marca_alias_case}
+                ELSE marca_normalizada
+            END
+        )
+    """)
+
+    # Hash do lado DENATRAN pra comparar contra canonical_str_fipe_sql (tier 2)
+    # -- usa a extração de modelo do DENATRAN (versão ainda vem como
+    # "MARCA/MODELO"), mas com a marca já passada pelo alias FIPE quando
+    # aplicável. Isso é só pra achar o match; vehicle_key em si nunca muda.
+    con.execute("""
+        CREATE OR REPLACE MACRO canonical_str_denatran_for_fipe_match_sql(marca, versao, ano, comb) AS
+            marca_alias_fipe_sql(normalize_text_sql(marca)) || '|' ||
             normalize_text_sql(extract_modelo_denatran_sql(versao)) || '|' ||
             COALESCE(trim(CAST(ano AS VARCHAR)), '0') || '|' ||
             map_combustivel_sql(comb)

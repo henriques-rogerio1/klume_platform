@@ -13,6 +13,17 @@ Duas dimensões de veículo, com propósitos diferentes e deliberados:
   - dim_veiculo_atual: Type 1 de propósito — "nosso melhor entendimento
     atual" pra cada vehicle_key, usado só pra alimentar segmentacao_klume.
 
+Preço FIPE (ver gold/build_fipe_match.py pro diagnóstico, plano em
+"shimmering-toasting-cookie"): dim_veiculo_atual ganha codigo_fipe,
+preco_fipe, match_tier_fipe, data_referencia_fipe (tier 2 = hash canônico
+contra silver.fipe_precos, tier 3 = crosswalk manual corrigido, tier 2 tem
+precedência sobre tier 3). fato_volumes_base ganha fipe/preco (tier 1, já
+vem embutido na linha de origem DENATRAN, confirmado sem fragmentação).
+A junção mora dentro de build_dim_veiculo_atual() (não é um passo
+desacoplado como build_dim_empresa.py) porque silver.fipe_precos é pequeno
+(~546K linhas) e dim_veiculo_atual já é CREATE OR REPLACE do zero a cada
+rodada de qualquer forma.
+
 Uso:
     python gold/build_volumes.py
 Requer MOTHERDUCK_TOKEN no .env.
@@ -40,6 +51,19 @@ COMMENTS = {
         "pra esse veículo — Type 1 por escolha, não representa nenhum momento histórico.",
         "segmentacao_klume": "Classificação de segmento mais recente conhecida pra esse "
         "vehicle_key, independente de quando o veículo foi vendido.",
+        "codigo_fipe": "Código FIPE do match mais recente pra esse vehicle_key — tier 2 "
+        "(hash canônico contra silver.fipe_precos) tem prioridade sobre tier 3 "
+        "(crosswalk manual, silver.mapping_table). NULL se nenhum dos dois achou.",
+        "preco_fipe": "Preço do match de tier 2 (silver.fipe_precos.preco) — só "
+        "preenchido quando match_tier_fipe = 2. Tier 3 não traz preço, só o código.",
+        "match_tier_fipe": "2 = hash canônico bateu contra o catálogo FIPE "
+        "(silver.vehicle_key.canonical_sql::canonical_str_fipe_sql, com alias de marca "
+        "quando aplicável — ver marca_alias_fipe.py). 3 = achou só via crosswalk manual. "
+        "NULL = nenhum dos dois.",
+        "data_referencia_fipe": "Mês de referência do preço em preco_fipe (o mais "
+        "recente disponível pra esse vehicle_key na última vez que o Gold rebuildou) — "
+        "sempre conferir antes de assumir que é o preço do mês corrente: se o veículo "
+        "saiu do catálogo FIPE, isso fica parado no último mês em que ele existia.",
     },
     "dim_geografia": {
         "codigo_municipio": "Código IBGE do município — chave natural, não surrogate. "
@@ -52,10 +76,21 @@ COMMENTS = {
     "fato_volumes_base": {
         "quantidade": "Medida aditiva — soma de veículos emplacados. Sempre agregar "
         "com SUM, nunca COUNT(*).",
-        "match_tier": "1 = código FIPE veio direto da fonte DENATRAN na própria linha. "
-        "NULL = não identificado. Não existe preço FIPE disponível ainda nesta versão.",
+        "match_tier": "Tier de match FIPE da própria linha de origem (tier 1 — código "
+        "FIPE veio direto na linha do DENATRAN). NULL = essa linha não trouxe FIPE "
+        "embutido; ver dim_veiculo_atual.match_tier_fipe pro match por catálogo "
+        "(tier 2/3), que é propriedade do veículo, não da venda.",
+        "fipe": "Código FIPE que já veio na própria linha do DENATRAN (tier 1) — "
+        "atributo da venda específica, verificado 2026-08-24 que não varia dentro da "
+        "combinação de colunas já agregada aqui (não fragmenta SUM(quantidade)).",
+        "preco": "Preço que já veio na própria linha do DENATRAN (tier 1), mesmo "
+        "caso de fipe acima.",
         "cnpj_basico_faturado": "8 primeiros dígitos do CNPJ de quem faturou (pessoa "
         "jurídica) — só preenchido quando tipo_faturado = 'CNPJ'.",
+        "empresa_key": "FK pra gold.dim_empresa. -1 = venda não faturada por CNPJ "
+        "(cnpj_basico_faturado NULL), -2 = CNPJ real sem correspondência em "
+        "nenhuma fonte Empresas na última vez que dim_empresa foi atualizada "
+        "(refresh manual, desacoplado deste build — ver gold/build_dim_empresa.py).",
     },
 }
 
@@ -72,7 +107,11 @@ GRAIN = {
     "codigo_municipio, cor_predominante, tipo_venda, match_tier e "
     "cnpj_basico_faturado — não existe grão de venda individual, só a soma por essa "
     "combinação de atributos (mesmo grão de _fato_pre, que agrega silver.veiculos "
-    "por GROUP BY ALL).",
+    "por GROUP BY ALL). empresa_key não adiciona granularidade — é totalmente "
+    "determinado por cnpj_basico_faturado (ver gold.dim_empresa). fipe/preco (tier 1) "
+    "também não adicionam granularidade — verificado 2026-08-24 que são "
+    "funcionalmente dependentes da combinação já agregada (0 grupos com mais de um "
+    "valor distinto).",
     "dim_veiculo_observado": "Uma linha representa uma combinação de atributos de "
     "veículo (vehicle_key, marca, modelo, versao, ano_modelo, combustivel_normalizado, "
     "segmentacao_atualizada, segmentacao_original, tipo_veiculo_principal) que "
@@ -80,7 +119,10 @@ GRAIN = {
     "inferir data de vigência.",
     "dim_veiculo_atual": "Uma linha representa o melhor entendimento atual (Type 1) "
     "de um vehicle_key — os atributos observados na venda mais recente desse "
-    "veículo, selecionados como linha completa (nunca arg_max por coluna isolada).",
+    "veículo, selecionados como linha completa (nunca arg_max por coluna isolada). "
+    "codigo_fipe/preco_fipe/match_tier_fipe/data_referencia_fipe (adicionado "
+    "2026-08-24) seguem o mesmo grão — match por catálogo FIPE mais recente "
+    "disponível pra esse vehicle_key, não muda a granularidade da linha.",
     "dim_geografia": "Uma linha representa um codigo_municipio (código IBGE) com o "
     "nome de município e estado mais recentemente observados (linha completa, não "
     "arg_max por coluna); -1 é a linha sentinela para 'sem código IBGE informado'.",
@@ -90,14 +132,14 @@ GRAIN = {
 }
 
 
-def apply_grain_comments(con) -> None:
-    for table, text in GRAIN.items():
+def apply_grain_comments(con, grain: dict = GRAIN) -> None:
+    for table, text in grain.items():
         text_escaped = text.replace("'", "''")
         con.execute(f"COMMENT ON TABLE gold.{table} IS '{text_escaped}'")
 
 
-def apply_comments(con) -> None:
-    for table, cols in COMMENTS.items():
+def apply_comments(con, comments: dict = COMMENTS) -> None:
+    for table, cols in comments.items():
         for col, text in cols.items():
             text_escaped = text.replace("'", "''")
             con.execute(f"COMMENT ON COLUMN gold.{table}.{col} IS '{text_escaped}'")
@@ -126,16 +168,52 @@ def build_dim_veiculo_observado(con) -> None:
 
 
 def build_dim_veiculo_atual(con) -> None:
+    # Preço FIPE (tier 2/3) é propriedade estável do vehicle_key, mesmo grão
+    # Type 1 já usado por segmentacao_klume — entra na MESMA construção, não
+    # numa segunda passada: dim_veiculo_atual é CREATE OR REPLACE a cada
+    # upload automático, uma UPDATE/ALTER separada seria apagada no próximo
+    # rebuild. Diferente do CNPJ (gold.dim_empresa, refresh desacoplado —
+    # tabelas de origem grandes demais pra reescanear toda hora), o dado FIPE
+    # é pequeno (silver.fipe_precos ~546 mil linhas), reconstruir junto é
+    # barato.
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE _fipe_tier2 AS
+        SELECT vehicle_key, codigo_fipe, preco, data_referencia
+        FROM silver.fipe_precos
+        QUALIFY row_number() OVER (
+            PARTITION BY vehicle_key
+            ORDER BY reference_month DESC, codigo_fipe, year_code
+        ) = 1
+    """)
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE _fipe_tier3 AS
+        SELECT vehicle_key, codigo_fipe_crosswalk
+        FROM silver.veiculos
+        WHERE codigo_fipe_crosswalk IS NOT NULL
+        QUALIFY row_number() OVER (
+            PARTITION BY vehicle_key
+            ORDER BY data_emplacamento DESC, codigo_fipe_crosswalk
+        ) = 1
+    """)
+
     con.execute("""
         CREATE OR REPLACE TABLE gold.dim_veiculo_atual AS
         SELECT
-            row_number() OVER (ORDER BY vehicle_key) AS veiculo_atual_key,
-            vehicle_key, marca, modelo, versao, ano_modelo, combustivel_normalizado,
-            segmentacao_atualizada AS segmentacao_klume,
-            segmentacao_original AS segmentacao_original_klume,
-            tipo_veiculo_principal AS tipo_veiculo_klume
+            row_number() OVER (ORDER BY a.vehicle_key) AS veiculo_atual_key,
+            a.vehicle_key, a.marca, a.modelo, a.versao, a.ano_modelo, a.combustivel_normalizado,
+            a.segmentacao_atualizada AS segmentacao_klume,
+            a.segmentacao_original AS segmentacao_original_klume,
+            a.tipo_veiculo_principal AS tipo_veiculo_klume,
+            COALESCE(t2.codigo_fipe, t3.codigo_fipe_crosswalk) AS codigo_fipe,
+            t2.preco AS preco_fipe,
+            CASE
+                WHEN t2.codigo_fipe IS NOT NULL THEN 2
+                WHEN t3.codigo_fipe_crosswalk IS NOT NULL THEN 3
+                ELSE NULL
+            END AS match_tier_fipe,
+            t2.data_referencia AS data_referencia_fipe
         FROM (
-            SELECT vehicle_key, marca, modelo, versao, ano_modelo,
+            SELECT vehicle_key, marca, modelo, versao, ano_modelo, combustivel,
                    map_combustivel_sql(combustivel) AS combustivel_normalizado,
                    segmentacao_atualizada, segmentacao_original, tipo_veiculo_principal
             FROM silver.veiculos
@@ -145,7 +223,11 @@ def build_dim_veiculo_atual(con) -> None:
                          combustivel_normalizado, segmentacao_atualizada,
                          segmentacao_original, tipo_veiculo_principal
             ) = 1
-        )
+        ) a
+        LEFT JOIN _fipe_tier2 t2
+          ON hash(canonical_str_denatran_for_fipe_match_sql(a.marca, a.versao, a.ano_modelo, a.combustivel))
+             = t2.vehicle_key
+        LEFT JOIN _fipe_tier3 t3 ON a.vehicle_key = t3.vehicle_key
     """)
 
 
@@ -194,6 +276,11 @@ def build_dim_data(con) -> None:
 
 
 def build_fato_volumes_base(con) -> None:
+    # fipe/preco (tier 1 -- código FIPE que já vinha na própria linha do
+    # DENATRAN) entram direto aqui, não em dim_veiculo_atual: são atributo
+    # da venda específica, não propriedade estável do veículo. Verificado
+    # antes de adicionar (2026-08-24): não fragmentam a agregação -- 0
+    # grupos de _fato_pre têm mais de um preco/fipe distinto.
     con.execute("""
         CREATE OR REPLACE TEMP TABLE _fato_pre AS
         SELECT
@@ -203,6 +290,7 @@ def build_fato_volumes_base(con) -> None:
             COALESCE(codigo_municipio, -1) AS codigo_municipio,
             municipio_emplacamento, estado_emplacamento,
             cor_predominante, tipo_venda, match_tier, cnpj_basico_faturado,
+            fipe, preco,
             SUM(quantidade) AS quantidade
         FROM silver.veiculos
         GROUP BY ALL
@@ -216,6 +304,12 @@ def build_fato_volumes_base(con) -> None:
             a.veiculo_atual_key,
             p.codigo_municipio, p.municipio_emplacamento, p.estado_emplacamento,
             p.cor_predominante, p.tipo_venda, p.match_tier, p.cnpj_basico_faturado,
+            p.fipe, p.preco,
+            CASE
+                WHEN p.cnpj_basico_faturado IS NULL THEN -1
+                WHEN e.empresa_key IS NULL THEN -2
+                ELSE e.empresa_key
+            END AS empresa_key,
             p.quantidade
         FROM _fato_pre p
         JOIN gold.dim_veiculo_observado o
@@ -230,6 +324,7 @@ def build_fato_volumes_base(con) -> None:
          AND p.tipo_veiculo_principal IS NOT DISTINCT FROM o.tipo_veiculo_principal
         JOIN gold.dim_veiculo_atual a ON p.vehicle_key = a.vehicle_key
         JOIN gold.dim_data d ON p.data_emplacamento = d.data
+        LEFT JOIN gold.dim_empresa e ON p.cnpj_basico_faturado = e.cnpj_basico
     """)
 
 
@@ -254,11 +349,15 @@ def build_compatibility_view(con) -> None:
             f.cor_predominante, f.tipo_venda, f.municipio_emplacamento, f.estado_emplacamento,
             o.tipo_veiculo_principal, f.cnpj_basico_faturado, f.match_tier,
             a.segmentacao_klume,
+            e.razao_social, e.categoria_empresa,
+            f.fipe, f.preco,
+            a.codigo_fipe, a.preco_fipe, a.match_tier_fipe, a.data_referencia_fipe,
             f.quantidade
         FROM gold.fato_volumes_base f
         JOIN gold.dim_veiculo_observado o ON f.veiculo_key = o.veiculo_key
         JOIN gold.dim_veiculo_atual a ON f.veiculo_atual_key = a.veiculo_atual_key
         JOIN gold.dim_data d ON f.data_key = d.data_key
+        JOIN gold.dim_empresa e ON f.empresa_key = e.empresa_key
     """)
 
 
@@ -284,6 +383,23 @@ def main():
     con = get_connection("motherduck")
     con.execute("CREATE SCHEMA IF NOT EXISTS gold")
     register_sql_macros(con)
+
+    # gold.dim_empresa tem refresh manual, desacoplado deste build (escaneia
+    # ~104M linhas de CNPJ, caro demais pra rodar a cada upload) — só constrói
+    # na primeira vez, se ainda não existir. Depois disso, quem quiser dado de
+    # CNPJ atualizado roda `python gold/build_dim_empresa.py` manualmente.
+    dim_empresa_exists = con.execute("""
+        SELECT COUNT(*) FROM information_schema.tables
+        WHERE table_schema = 'gold' AND table_name = 'dim_empresa'
+    """).fetchone()[0] > 0
+    if not dim_empresa_exists:
+        print("gold.dim_empresa não existe ainda — construindo pela primeira vez (bootstrap)...")
+        from gold.build_dim_empresa import build_dim_empresa
+        from gold.build_dim_empresa import COMMENTS as DIM_EMPRESA_COMMENTS
+        from gold.build_dim_empresa import GRAIN as DIM_EMPRESA_GRAIN
+        build_dim_empresa(con)
+        apply_grain_comments(con, DIM_EMPRESA_GRAIN)
+        apply_comments(con, DIM_EMPRESA_COMMENTS)
 
     print("Construindo dim_veiculo_observado...")
     build_dim_veiculo_observado(con)
@@ -320,6 +436,14 @@ def main():
         "— o build perdeu ou inflou volume."
     )
     print("OK: SUM(quantidade) do Gold bate com o Silver (nenhum volume perdido/inflado).")
+
+    n_orfaos_empresa = con.execute("""
+        SELECT COUNT(*) FROM gold.fato_volumes_base f
+        LEFT JOIN gold.dim_empresa d ON f.empresa_key = d.empresa_key
+        WHERE d.empresa_key IS NULL
+    """).fetchone()[0]
+    assert n_orfaos_empresa == 0, f"{n_orfaos_empresa} linha(s) com empresa_key sem dimensão correspondente."
+    print("OK: toda empresa_key em fato_volumes_base resolve em gold.dim_empresa.")
 
     for tbl, key in [
         ("dim_veiculo_observado", "veiculo_key"),
