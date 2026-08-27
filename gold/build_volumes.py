@@ -91,6 +91,15 @@ COMMENTS = {
         "(cnpj_basico_faturado NULL), -2 = CNPJ real sem correspondência em "
         "nenhuma fonte Empresas na última vez que dim_empresa foi atualizada "
         "(refresh manual, desacoplado deste build — ver gold/build_dim_empresa.py).",
+        "quantidade_tipo_venda_conhecido": "Medida aditiva auxiliar (2026-08-24): "
+        "= quantidade quando tipo_venda IN ('Varejo','Direta'), NULL quando "
+        "tipo_venda é NULL ou 'ND'. Existe pra calcular % varejo-vs-direta com "
+        "SUM() direto, sem repetir a exclusão de NULL/ND em cada consumidor — "
+        "% de participação de marca no mercado TOTAL continua usando "
+        "quantidade (denominador diferente, não confundir os dois). "
+        "tipo_venda só é confiável a partir de 2020 (2016 é 100% NULL — "
+        "campo não veio na fonte daquele ano); isso não é um filtro aplicado "
+        "aqui, quem consome decide o intervalo de datas.",
     },
 }
 
@@ -111,7 +120,8 @@ GRAIN = {
     "determinado por cnpj_basico_faturado (ver gold.dim_empresa). fipe/preco (tier 1) "
     "também não adicionam granularidade — verificado 2026-08-24 que são "
     "funcionalmente dependentes da combinação já agregada (0 grupos com mais de um "
-    "valor distinto).",
+    "valor distinto). quantidade_tipo_venda_conhecido (2026-08-24) é medida "
+    "derivada de quantidade+tipo_venda já presentes na linha, não muda o grão.",
     "dim_veiculo_observado": "Uma linha representa uma combinação de atributos de "
     "veículo (vehicle_key, marca, modelo, versao, ano_modelo, combustivel_normalizado, "
     "segmentacao_atualizada, segmentacao_original, tipo_veiculo_principal) que "
@@ -175,7 +185,9 @@ def build_dim_veiculo_atual(con) -> None:
     # rebuild. Diferente do CNPJ (gold.dim_empresa, refresh desacoplado —
     # tabelas de origem grandes demais pra reescanear toda hora), o dado FIPE
     # é pequeno (silver.fipe_precos ~546 mil linhas), reconstruir junto é
-    # barato.
+    # barato. Padrão geral (acoplado vs. desacoplado é pelo volume da fonte,
+    # não pelo domínio) documentado em docs/ARQUITETURA.md "Demais dimensões"
+    # e replicado em gold/build_dim_empresa.py.
     con.execute("""
         CREATE OR REPLACE TEMP TABLE _fipe_tier2 AS
         SELECT vehicle_key, codigo_fipe, preco, data_referencia
@@ -310,7 +322,9 @@ def build_fato_volumes_base(con) -> None:
                 WHEN e.empresa_key IS NULL THEN -2
                 ELSE e.empresa_key
             END AS empresa_key,
-            p.quantidade
+            p.quantidade,
+            CASE WHEN p.tipo_venda IN ('Varejo', 'Direta') THEN p.quantidade ELSE NULL END
+                AS quantidade_tipo_venda_conhecido
         FROM _fato_pre p
         JOIN gold.dim_veiculo_observado o
           ON p.vehicle_key = o.vehicle_key
@@ -352,7 +366,7 @@ def build_compatibility_view(con) -> None:
             e.razao_social, e.categoria_empresa,
             f.fipe, f.preco,
             a.codigo_fipe, a.preco_fipe, a.match_tier_fipe, a.data_referencia_fipe,
-            f.quantidade
+            f.quantidade, f.quantidade_tipo_venda_conhecido
         FROM gold.fato_volumes_base f
         JOIN gold.dim_veiculo_observado o ON f.veiculo_key = o.veiculo_key
         JOIN gold.dim_veiculo_atual a ON f.veiculo_atual_key = a.veiculo_atual_key
@@ -379,8 +393,12 @@ def build_current_period_views(con) -> None:
     """)
 
 
-def main():
-    con = get_connection("motherduck")
+def main(con=None):
+    # con=None (default): comportamento de sempre, conecta no MotherDuck real.
+    # con explícito: permite rodar o mesmo main() -- os mesmos asserts que já
+    # existiam, sem duplicar lógica -- contra um fixture local em teste. Ver
+    # gold/tests/test_build_volumes.py.
+    con = con or get_connection("motherduck")
     con.execute("CREATE SCHEMA IF NOT EXISTS gold")
     register_sql_macros(con)
 
@@ -452,6 +470,11 @@ def main():
     ]:
         mx = con.execute(f"SELECT MAX({key}) FROM gold.{tbl}").fetchone()[0]
         print(f"MAX({tbl}.{key}) = {mx:,}")
+        n_dup = con.execute(
+            f"SELECT COUNT(*) FROM (SELECT {key} FROM gold.{tbl} GROUP BY {key} HAVING COUNT(*) > 1)"
+        ).fetchone()[0]
+        assert n_dup == 0, f"{n_dup} chave(s) surrogate duplicada(s) em gold.{tbl}.{key}."
+    print("OK: chaves surrogate únicas em dim_veiculo_observado, dim_veiculo_atual e dim_data.")
 
 
 if __name__ == "__main__":

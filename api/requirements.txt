@@ -1,0 +1,12 @@
+# Dependências mínimas pra rodar a API em produção (EC2) -- deliberadamente
+# menor que o requirements.txt da raiz (que inclui streamlit/vanna/pandas/
+# etc., nada disso usado aqui). Confirmado: silver/db/connection.py (única
+# dependência cruzada do resto do repo) só importa os/duckdb/dotenv, então
+# instalar só isto é suficiente -- ver plano "API externa pra Klume One".
+#
+# Pra desenvolvimento/testes locais, o .venv da raiz (requirements.txt) já
+# cobre tudo isto também -- este arquivo só importa pro deploy de produção.
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+duckdb>=0.10.0
+python-dotenv>=1.0.0

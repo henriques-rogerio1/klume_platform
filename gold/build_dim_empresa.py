@@ -21,6 +21,11 @@ frequente do que este refresh precisa rodar. CNPJ que aparecer entre um
 refresh e outro fica com a sentinela "Não identificado" (-2) até o próximo
 refresh — sem urgência, nada no produto depende disso no mesmo dia.
 
+Padrão geral (acoplado vs. desacoplado ao enriquecer o Gold, aplicado aqui e
+em gold/build_volumes.py::build_dim_veiculo_atual pro preço FIPE): a escolha
+é pelo volume da fonte, não pelo domínio — ver docs/ARQUITETURA.md, seção
+"Demais dimensões".
+
 Uso:
     python gold/build_dim_empresa.py                      # build normal
     python gold/build_dim_empresa.py --verify-determinism  # build 2x, diff (caro)

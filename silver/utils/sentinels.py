@@ -1,10 +1,15 @@
 """
-Normalização de valores-sentinela de ausência ("nan", "-", "", "None") para NULL real.
+Normalização de valores-sentinela de ausência ("nan", "-", "", "None") para NULL real,
+e de espaço em branco incidental (ex: "FIAT " vs "FIAT" — mesma marca, grafias
+diferentes por safra de arquivo) via trim().
 
 Bronze usa mais de um sentinela pra "ausente" dependendo da era do dado
 (ex: FIPE = 'nan' em 2016, '-' em 2025). Tratar isso coluna a coluna é frágil
 (foi exatamente o bug encontrado) — aqui é uma regra única aplicada a todas
-as colunas de uma vez, antes de qualquer cast tipado.
+as colunas de uma vez, antes de qualquer cast tipado. Achado 2026-08-24: o
+mesmo raciocínio vale pra espaço em branco nas pontas — sem isso, marca/modelo
+etc. duplicavam silenciosamente no Gold (ex: "TOYOTA" e "TOYOTA " como duas
+linhas de dimensão distintas).
 """
 
 DEFAULT_SENTINELS = ("nan", "NaN", "-", "", "None", "null", "NULL")
@@ -14,7 +19,7 @@ def register_blank_to_null_macro(con, sentinels: tuple[str, ...] = DEFAULT_SENTI
     sentinel_list = ", ".join("'" + s.replace("'", "''") + "'" for s in sentinels)
     con.execute(
         f"CREATE OR REPLACE MACRO blank_to_null(x) AS "
-        f"CASE WHEN x IS NULL OR trim(x) IN ({sentinel_list}) THEN NULL ELSE x END"
+        f"CASE WHEN x IS NULL OR trim(x) IN ({sentinel_list}) THEN NULL ELSE trim(x) END"
     )
 
 

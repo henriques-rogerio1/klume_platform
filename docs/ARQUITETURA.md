@@ -186,6 +186,17 @@ Solução: duas dimensões, dois propósitos, nenhuma inventando uma linha do te
     pequeno o bastante (~546 mil linhas) pra reconstruir a cada upload
     automático, e uma segunda passada separada seria apagada no próximo
     rebuild de qualquer forma.
+- **Padrão: refresh acoplado vs. desacoplado ao enriquecer o Gold** — `dim_empresa`
+  (acima) e o preço FIPE (acima) parecem duas decisões desconectadas, mas são a
+  mesma regra aplicada duas vezes: a escolha não é por domínio, é pelo volume da
+  fonte em relação à frequência de rebuild do Gold. Fonte grande o bastante que
+  reescanear a cada upload seria caro (CNPJ: ~104M linhas) → refresh manual/
+  desacoplado, sentinela até o próximo refresh. Fonte pequena o bastante que
+  reescanear é barato (FIPE: ~546 mil linhas) → embutido na mesma
+  `CREATE OR REPLACE` de sempre. Ao decidir a próxima fonte de enriquecimento
+  (Preço Transacionado, `docs/architecture-roadmap.md` item C2), aplicar essa
+  mesma regra em vez de rederivar do zero — ver comentário equivalente em
+  `gold/build_dim_empresa.py` e `gold/build_volumes.py::build_dim_veiculo_atual`.
 
 ### `gold.fato_volumes_base` (fato física) + `gold.fato_volumes` (view)
 
