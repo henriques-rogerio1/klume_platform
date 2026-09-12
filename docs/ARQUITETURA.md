@@ -5,10 +5,9 @@ Documento vivo — atualizar conforme a plataforma evolui.
 
 ## Visão geral
 
-Arquitetura medalhão (Bronze → Silver → Gold), tudo hospedado no **MotherDuck**
-(`Klume_DB_Cloud`), consumido por um app interno (Vanna + Streamlit) e, no futuro,
-por um MCP para clientes externos e por ferramentas de BI (Tableau/Power BI) direto
-no Gold.
+Arquitetura medalhão (Bronze → Silver → Gold), tudo hospedado no **MotherDuck**,
+consumido por um app interno (Vanna + Streamlit) e, no futuro, por um MCP para
+clientes externos e por ferramentas de BI (Tableau/Power BI) direto no Gold.
 
 ```
 Bronze (staging.*)  →  Silver (silver.*)  →  Gold (gold.*)  →  App / BI / MCP
@@ -18,22 +17,25 @@ CNPJ Receita              tipado                fato + dims      Tableau/Power B
 
 ## Bronze
 
-- **DENATRAN**: tabelas `staging.bronze_2000`...`bronze_2025` no MotherDuck (ingestão
-  manual via DBeaver, cobertura irregular — vários anos vazios/parciais). Fonte
-  original em Parquet local (`data/bronze/veiculos_raw`), organizada por
-  `{ano}/{YYYYMM}/`. Schema bruto: 44-48 colunas, tudo `VARCHAR`, com deriva de
-  formato por safra (data com/sem traço, combustível com/sem acento e padding).
-- **CNPJ (Receita Federal)**: `staging.bronze_master_cnpj` (Empresas, 40,4M linhas) e
-  `staging.bronze_master_estabelecimentos` (Estabelecimentos, com `nome_fantasia` e
-  CNAE, 63,8M linhas) — já limpos, usados como referência externa (não duplicados no
-  Silver/Gold).
-- **FIPE**: `staging.raw_json_fipe` (2026-08-24), populado por um bulk loader
-  próprio a partir dos CSVs já extraídos em
-  `s3://klume-volumes-s3-platform/Fipe_Csv/` (~354 mil linhas, Cars/Bikes/Trucks,
-  ~11 meses de histórico) — não pelo script linha-a-linha do repo separado
-  `fipe_api` (levaria horas pra esse volume). `fipe_api` (orquestrado por Mage AI)
-  continua sendo a fonte de verdade pra *chamar* a API FIPE; só a ingestão pro
-  MotherDuck foi refeita aqui.
+- **DENATRAN**: tabelas `staging.bronze_2000`...`bronze_2025` no MotherDuck. Ingestão
+  de batches históricos via client SQL direto (legado em migração para pipeline
+  programática), cobertura irregular (vários anos vazios/parciais) como resultado
+  direto disso. Fonte original em
+  Parquet local, organizada por `{ano}/{YYYYMM}/`. Schema bruto: 44-48 colunas,
+  tudo `VARCHAR`, com deriva de formato por safra (data com/sem traço, combustível
+  com/sem acento e padding).
+- **CNPJ (Receita Federal)**: base "Empresas" (40,4M linhas) e base
+  "Estabelecimentos" (com `nome_fantasia` e CNAE, 63,8M linhas) — já limpas, usadas
+  como referência externa (não duplicadas no Silver/Gold). Fonte bruta arquivada em
+  Parquet em armazenamento frio (`s3://<klume-data-lake-bucket>/cnpj/`), lida sob
+  demanda quando o enriquecimento de empresa no Gold precisa reprocessar.
+- **FIPE**: tabela de staging populada por um bulk loader próprio a partir dos CSVs
+  já extraídos em `s3://<klume-data-lake-bucket>/fipe/csv/` (~354 mil linhas,
+  Cars/Bikes/Trucks, ~11 meses de histórico) — não pelo script linha-a-linha do
+  repositório separado de coleta FIPE (inviável computacionalmente para cargas em
+  lote dessa magnitude). Esse repositório separado (orquestrado por Mage AI)
+  continua sendo a fonte de verdade pra *chamar* a API FIPE; o pipeline de
+  ingestão analítica foi desacoplado e otimizado para o data warehouse.
 
 ## Silver
 
@@ -57,7 +59,7 @@ CNPJ Receita              tipado                fato + dims      Tableau/Power B
   completo com hash) e `silver.veiculos_historico` (`< 2000`, só normalizado, sem
   hash — raramente consultado, custo de manutenção não compensa).
 - **Estado atual**: só 2016, 2020, 2025 (amostra) + uma amostra de 1957 foram
-  processados — não é o histórico completo ainda.
+  processados — cobertura histórica em processo de expansão/backfill.
 
 ## Gold
 
@@ -68,14 +70,37 @@ A primeira versão de `gold.fato_volumes` era uma única tabela desnormalizada (
 ~7,7M linhas. Reformulado pra um star schema de verdade porque:
 - Não tinha lugar sensato pra documentar colunas (um valor repetido milhões de vezes
   não é onde se pendura metadado de ontologia).
-- Chaves precisam ser inteiras pequenas, não hash, porque Tableau/Power BI sofrem em
-  performance de join com hash de 64 bits.
+- Chaves precisam ser inteiras de largura fixa, não texto repetido em cada uma das
+  ~7,7M linhas.
+
+### Estabilidade da chave surrogate
+
+As 3 chaves surrogate do star schema (`veiculo_key`, `veiculo_atual_key`,
+`empresa_key`) são hash determinístico de 64 bits da chave de negócio correspondente
+(mesmo domínio já usado em `vehicle_key`), mascarado no bit de sinal pra caber num
+`BIGINT` assinado — não `ROW_NUMBER() OVER (ORDER BY <chave de negócio>)`. Motivo:
+`ROW_NUMBER()` não é *estável* sob inserção — uma entidade nova que ordena antes de
+uma existente desloca toda chave depois dela a cada rebuild, corrompendo
+silenciosamente qualquer FK física já persistida em `fato_volumes_base`. Hash não
+depende do estado do conjunto (`K(e)` não muda quando outra linha é inserida),
+satisfaz estabilidade sem precisar de nenhuma tabela de-para persistida. Verificado
+contra produção: zero colisão nas 3 dimensões, determinismo (dois builds seguidos, 0
+diferenças), e estabilidade de verdade (entidade sintética inserida antes de todas as
+existentes não desloca nenhuma chave preexistente).
+
+Trade-off aceito conscientemente: ferramentas de BI que conectam direto (Tableau/
+Power BI) tendem a sofrer mais em performance de join com hash de 64 bits do que com
+inteiro sequencial pequeno — hoje não existe essa conexão, então o risco está
+adormecido, não ativo. Gatilho de revisão: se/quando uma conexão de BI direta for
+construída, decidir nesse momento se vale uma camada de apresentação com inteiro
+compacto (não necessariamente uma tabela de-para permanente) — não construir essa
+camada agora, pra um consumidor que ainda não existe.
 
 A ontologia vive no próprio banco: `COMMENT ON COLUMN` em cada coluna não óbvia, e
 `COMMENT ON TABLE` com o **grão** de cada tabela como frase verificável ("uma linha
 representa..."), aplicados em `gold/build_volumes.py::apply_comments` /
-`apply_grain_comments`. Metodologia: skill `dimensional-modeler` (Kimball, ver
-`~/.claude/skills/dimensional-modeler/SKILL.md`) — grão declarado, SCD por atributo,
+`apply_grain_comments`. Metodologia seguindo as diretrizes de modelagem dimensional
+de Ralph Kimball (*The Data Warehouse Toolkit*) — grão declarado, SCD por atributo,
 seleção de linha vencedora sempre completa (nunca `arg_max`/`ROW_NUMBER` por coluna
 isolada), determinismo testado construindo o Gold duas vezes seguidas e comparando
 linha a linha (`EXCEPT` nos dois sentidos, não só contagem/soma) — as 5 tabelas do
@@ -108,15 +133,15 @@ Solução: duas dimensões, dois propósitos, nenhuma inventando uma linha do te
 
 ### Demais dimensões
 
-- **`gold.dim_geografia`** — chave natural `codigo_municipio` (código IBGE, ~5.572
-  valores, bate com o número real de municípios do Brasil). Usar o nome em texto como
+- **`gold.dim_geografia`** — chave natural `codigo_municipio` (código IBGE),
+  aderente à malha territorial do IBGE (5.570+ municípios). Usar o nome em texto como
   chave seria errado — nomes colidem entre estados (ex: "Bom Jesus" existe em 6).
   Município e estado vêm da mesma linha vencedora (`QUALIFY ROW_NUMBER`), não de
   `arg_max` independente por coluna — nos dados atuais nunca divergia (nenhum
   `codigo_municipio` observado com mais de um nome/estado), mas `arg_max` por coluna
   isolada podia, em tese, misturar município de uma data com estado de outra. Linha
-  sentinela (`-1`, `'NÃO IDENTIFICADO'`) pra nunca deixar um `JOIN` comum
-  derrubar linha silenciosamente (~23% dos registros não têm código IBGE — mas TÊM o
+  sentinela (`-1`, `'NÃO IDENTIFICADO'`) mitigando o descarte silencioso de métricas
+  em operações de INNER JOIN (~23% dos registros não têm código IBGE — mas TÊM o
   nome do município em texto, por isso o texto também fica direto na fato, não só
   via essa dimensão).
 - **`gold.dim_data`** — calendário contínuo (todo dia entre o mínimo e o máximo
@@ -124,35 +149,35 @@ Solução: duas dimensões, dois propósitos, nenhuma inventando uma linha do te
 - Atributos de cardinalidade trivial (`cor_predominante`=18, `tipo_venda`=3,
   `match_tier`=2) ficam **inline na fato** — DuckDB/Parquet já comprime string de
   baixa cardinalidade bem, uma dimensão separada só adicionaria join sem ganho real.
-- **`gold.dim_empresa`** (2026-08-20) — enriquecimento de `cnpj_basico_faturado`
-  (razão social, CNAE, `categoria_empresa`). Escopo deliberadamente restrito aos
-  ~8.455 CNPJs que já aparecem em `silver.veiculos` — não os ~65M CNPJs da Receita
-  Federal inteira. Fonte: `staging.bronze_master_cnpj` + `main.CNPJ_empresas_final`
-  (mesma base "Empresas", schema idêntico, **zero sobreposição verificada** entre
-  as duas — juntas cobrem 99,98% dos CNPJs relevantes, nenhuma sozinha passa de
-  75%) + linha matriz de `staging.bronze_master_estabelecimentos` (CNAE, cobre
-  96,6%). `categoria_empresa` classifica por CNAE: `45xx` = concessionária/comércio
-  de veículos (54% do volume faturado por CNPJ), `771x` = locadora (deliberadamente
+- **`gold.dim_empresa`** — enriquecimento de `cnpj_basico_faturado` (razão social,
+  CNAE, `categoria_empresa`). Escopo deliberadamente restrito aos ~8.455 CNPJs que já
+  aparecem em `silver.veiculos` — não os ~65M CNPJs da Receita Federal inteira. Fonte:
+  as duas bases "Empresas" (mesmo schema, **zero sobreposição verificada** entre as
+  duas — juntas cobrem 99,98% dos CNPJs relevantes, nenhuma sozinha passa de 75%) +
+  linha matriz da base "Estabelecimentos" (CNAE, cobre 96,6%). A fonte bruta dessas
+  três bases não fica residente no banco principal — vive arquivada em Parquet (ver
+  seção Bronze), lida sob demanda quando este enriquecimento precisa reprocessar.
+  `categoria_empresa` classifica por CNAE: `45xx` = concessionária/comércio de
+  veículos (54% do volume faturado por CNPJ), `771x` = locadora (deliberadamente
   mais estreito que `77xx` inteiro, que também pegaria aluguel de máquinas sem
   relação com veículo). Duas sentinelas em `empresa_key` (não em `cnpj_basico` —
-  `'00000000'` é um CNPJ real, Banco do Brasil, então não pode virar sentinela):
-  `-1` = venda não faturada por CNPJ, `-2` = CNPJ real sem correspondência em
-  nenhuma fonte Empresas. **Refresh é manual, desacoplado do pipeline automático de
-  upload** (`python gold/build_dim_empresa.py`) — evita escanear ~104M linhas de
-  CNPJ a cada arquivo novo de volumes; `gold/build_volumes.py::main()` só constrói
+  `'00000000'` é um CNPJ real, então não pode virar sentinela): `-1` = venda não
+  faturada por CNPJ, `-2` = CNPJ real sem correspondência em nenhuma fonte Empresas.
+  **Refresh é manual, desacoplado do pipeline automático de upload**
+  (`python gold/build_dim_empresa.py`) — evita reescanear as bases de CNPJ inteiras a
+  cada arquivo novo de volumes; `gold/build_volumes.py::main()` só constrói
   `dim_empresa` automaticamente na primeira vez (bootstrap), depois disso CNPJ novo
   fica com a sentinela `-2` até o próximo refresh manual.
-- **Preço FIPE em `gold.dim_veiculo_atual`** (2026-08-24) — `codigo_fipe`,
-  `preco_fipe`, `match_tier_fipe`, `data_referencia_fipe`, mesmo grão Type 1 já
-  usado por `segmentacao_klume` (propriedade estável do `vehicle_key`, não da
-  venda). Fonte: `silver.fipe_precos` (normalizador novo,
-  `silver/normalizers/fipe.py`, populado a partir dos CSVs já extraídos em
-  `s3://klume-volumes-s3-platform/Fipe_Csv/`, ~546 mil linhas, grão
-  `codigo_fipe × year_code × reference_month` — histórico completo mantido,
-  não colapsado, porque módulos futuros de TCO/Preço Transacionado vão
-  precisar de trajetória de preço). Três tiers, ativando um conceito que já
-  existia documentado desde sempre mas nunca tinha código (`match_tier`
-  aparecia em `fato_volumes_base` sem nenhuma linha marcada tier 2):
+- **Preço FIPE em `gold.dim_veiculo_atual`** — `codigo_fipe`, `preco_fipe`,
+  `match_tier_fipe`, `data_referencia_fipe`, mesmo grão Type 1 já usado por
+  `segmentacao_klume` (propriedade estável do `vehicle_key`, não da venda). Fonte:
+  `silver.fipe_precos` (normalizador `silver/normalizers/fipe.py`, populado a partir
+  dos CSVs já extraídos, ~546 mil linhas, grão `codigo_fipe × year_code ×
+  reference_month` — histórico completo mantido, não colapsado, porque módulos
+  futuros de TCO/Preço Transacionado vão precisar de trajetória de preço). Três
+  tiers, ativando um conceito que já existia documentado desde sempre mas nunca tinha
+  código (`match_tier` aparecia em `fato_volumes_base` sem nenhuma linha marcada tier
+  2):
   - **Tier 1** (na própria fato, não aqui): código FIPE que já vinha embutido
     na linha de origem do DENATRAN — inalterado, ver `fato_volumes_base`
     abaixo.
@@ -172,13 +197,9 @@ Solução: duas dimensões, dois propósitos, nenhuma inventando uma linha do te
     silenciosamente, e o tier 3 abaixo já resolve essa classe de problema
     melhor (ver `docs/architecture-roadmap.md` item B2 pro raciocínio
     completo).
-  - **Tier 3**: o crosswalk manual pré-existente (`silver.mapping_table`),
-    com dois bugs corrigidos nesta rodada — descartava o código que acabara
-    de casar (`SELECT * EXCLUDE(...)`, guardava só o flag) e tratava strings
-    de anotação (`'NE'`, `'A'`, `'ND'`, `'ver'`) como match válido. Corrigir
-    os dois removeu 54.771 falsos-positivos (2.857.766 → 2.802.995 linhas).
-    Continua sendo o tier de maior cobertura real (44% do volume) — curadoria
-    humana lida melhor com a divergência de vocabulário do que o hash exato.
+  - **Tier 3**: crosswalk manual pré-existente, cobertura real de 44% do
+    volume — curadoria humana lida melhor com a divergência de vocabulário
+    do que o hash exato.
   - Tier 2 tem precedência sobre tier 3 quando ambos casam. `NULL` = nenhum
     dos dois achou (~47% do volume hoje).
   - Construído dentro do mesmo `CREATE OR REPLACE` de `dim_veiculo_atual`
@@ -215,13 +236,16 @@ conectam direto (Tableau/Power BI) usam as tabelas físicas; o app usa a view.
 - **Vanna** (`app/vanna_client.py`, `app/training_data.py`) — texto → SQL, Claude
   Haiku (barato, tarefa mecânica), ChromaDB local como memória de treino.
   `get_vanna()` treina sozinho no primeiro uso se detectar memória vazia (necessário
-  porque `app/chroma_store/` é gitignored — um deploy novo no Streamlit Cloud não
-  teria treino nenhum sem isso).
+  porque `app/chroma_store/` é gitignored — um deploy novo não teria treino nenhum
+  sem isso). `get_vanna()` é cacheado por processo (`@st.cache_resource`) — a
+  checagem "já tem treino?" só roda uma vez por processo, não em toda interação do
+  usuário; o embedding em si é local (ONNX, sem chamada de rede), Claude só entra em
+  tempo de consulta.
 - **Streamlit** (`app/streamlit_app.py`) — pergunta → SQL → seletor de dimensões (sem
   precisar saber SQL, reconstrói a pergunta com a dimensão pedida) → tabela → gráfico
   automático (quando poucas dimensões) → export CSV/Excel. Limite de segurança: acima
   de 300 mil linhas a consulta é recusada (protege contra estourar o limite do Excel
-  e a memória do plano gratuito do Streamlit Cloud).
+  e a memória disponível do processo da aplicação).
 - **Identidade visual**: cores extraídas direto do SVG da logo oficial (`#EB671B`,
   `#141415`), não de uma paleta genérica.
 - **Login**: suporte nativo do Streamlit (`st.login`, OIDC/Google) — código pronto,
@@ -229,29 +253,37 @@ conectam direto (Tableau/Power BI) usam as tabelas físicas; o app usa a view.
   Console, incluindo lista de "test users").
 - **Histórico de queries**: `app/query_log.py` grava toda pergunta em
   `app.query_log` no MotherDuck (usuário, pergunta, SQL, linhas, duração) — base pra
-  futuramente promover perguntas frequentes a exemplos de treino do Vanna.
+  futuramente promover perguntas frequentes a exemplos de treino do Vanna. A escrita
+  roda numa thread separada com conexão própria (nunca a conexão cacheada da thread
+  principal — `DuckDBPyConnection` não é segura pra execução concorrente do mesmo
+  objeto entre threads), não bloqueia o resultado na tela; `try/except` silencioso por
+  design (log é best-effort). A checagem/criação da tabela (`_ensure_table_once`)
+  também é cacheada por processo, não roda a cada pergunta.
 - **Upload de dados** (`app/pages/1_Upload_Dados.py`) — página operacional, não pra
-  vendedor: XLSX novo → casa colunas com `staging.bronze_{ano}` por nome → insere no
-  MotherDuck → dual-write pro S3 → **Silver+Gold reconstroem automaticamente, sem
-  botão** (mudou de manual pra obrigatório em 2026-08-11: arquivo novo chega poucas
-  vezes por mês, então o custo de sempre reprocessar é baixo, e um clique manual
-  esquecido deixava o Gold desatualizado sem nenhum aviso). A tela mostra a pipeline
-  como etapas nomeadas (`st.status`, estilo Airflow/CI — cada etapa rotulada com a
-  função/script por trás), pra facilitar isolar em qual passo algo quebrou.
-  Duas proteções, adicionadas depois de um upload de teste (1958)
-  deixar 30 linhas órfãs no Bronze por quebrar no passo do S3 (secret AWS não
-  configurado na Streamlit Cloud, mas o INSERT no MotherDuck já tinha rodado):
-  - **`app.upload_log`** (ts, filename, hash SHA-256 do arquivo, ano, rows_inserted,
-    s3_ok) — hash registrado logo após o INSERT no MotherDuck ter sucesso, **antes**
-    de tentar o S3, pra uma falha no S3 não deixar uma reexecução vulnerável a
-    duplicar linhas. Arquivo com hash já visto no log é bloqueado antes de tocar em
-    qualquer tabela. Falha no S3 é capturada (não derruba a página) e fica visível
-    como `s3_ok = false`, em vez de crash sem rastro do que já foi inserido.
-  - **Schema validation**: rejeita o arquivo antes de qualquer insert se faltar
-    alguma coluna obrigatória (`Data de Emplacamento`, `Marca`, `Modelo`,
-    `Quantidade`) ou se menos de 50% das colunas do formato DENATRAN de referência
-    (`staging.bronze_2024`) baterem — antes disso, coluna faltando virava `NULL`
-    silencioso, sem checagem de que o arquivo era o formato certo.
+  vendedor: XLSX novo → casa colunas com `staging.bronze_{ano}` por nome → sobe pro S3
+  primeiro, por (ano, mês) como unidade atômica → só se **todos** os meses daquele ano
+  subiram com sucesso, insere no MotherDuck (escopado a `DELETE`+`INSERT` pelas
+  combinações ano/mês deste upload, não o ano inteiro — Bronze acumula uploads
+  distintos ao longo do tempo, substituir o ano todo apagaria carga anterior não
+  relacionada) → **acionamento de pipeline determinístico síncrono acoplado ao evento
+  de carga** (mudou de manual pra obrigatório: arquivo novo chega poucas vezes por
+  mês, então o custo de sempre reprocessar é baixo, e um clique manual esquecido
+  deixava o Gold desatualizado sem nenhum aviso). Falha no S3 pra qualquer mês
+  interrompe o ano inteiro (erro claro, nada fica parcialmente aplicado) — desenho
+  deliberado de "falha fechada" em vez de "degrada com aviso", pra nunca deixar o
+  banco principal com dado sem cópia correspondente no armazenamento frio. A tela
+  mostra a pipeline como etapas nomeadas
+  (`st.status`, estilo Airflow/CI — cada etapa rotulada com a função/script por trás),
+  pra facilitar isolar em qual passo algo quebrou.
+  O pipeline implementa idempotência via hash SHA-256 do arquivo, registrado no
+  catálogo de ingestão (`app.upload_log`) logo após a etapa principal de persistência
+  ter sucesso e **antes** de tentar as etapas seguintes — uma falha numa etapa
+  posterior não deixa uma reexecução vulnerável a duplicar linha, e fica registrada
+  como incompleta em vez de mascarada. Arquivo com hash já visto no log é bloqueado
+  antes de tocar em qualquer tabela. Validação de schema roda antes de qualquer
+  insert: rejeita o arquivo se faltar coluna obrigatória ou se o formato divergir
+  demais da referência conhecida — antes disso, coluna faltando virava `NULL`
+  silencioso.
 
 ## Decisão de acesso: interno vs. externo
 
@@ -263,42 +295,38 @@ Duas superfícies diferentes pro mesmo Gold, não um mecanismo só:
   (ex: preço FIPE atual vs. histórico) de forma estrutural, não como política de
   query espalhada. **Ainda não construído.**
 
+## Retenção e armazenamento
+
+Arquitetura otimizada para retenção híbrida: dado bruto de baixa frequência de
+acesso (anos históricos de Bronze, bases fonte de CNPJ já processadas no Gold) fica
+em Parquet em armazenamento frio (S3), lido sob demanda via `read_parquet('s3://...')`
+quando um reprocessamento precisa dele — não reside permanentemente no banco
+principal. Isso contém o footprint de armazenamento ativo no MotherDuck ao que é
+efetivamente consultado no dia a dia, sem perder a fonte bruta.
+`normalize_denatran()` já aceita `read_parquet('s3://...')` como fonte, sem mudança
+de código, pros anos de Bronze que ainda migrarem pra esse padrão.
+
 ## Pendências conhecidas
 
 - **Backfill completo do Silver** — só 2016/2020/2025 + amostra de 1957 processados.
-- **Migrar anos de Bronze pro S3** (mesmo bucket do `fipe_api`) antes de apagar do
-  MotherDuck — armazenamento perto do limite do plano gratuito.
-  `normalize_denatran()` já aceita `read_parquet('s3://...')` como fonte, sem mudança
-  de código.
-- **Join preço FIPE × volume — feito** (`gold.dim_veiculo_atual`, 2026-08-24, ver
-  seção "Demais dimensões"). Pendências restantes: tier 2 tem yield baixo em
-  carros por divergência de vocabulário DENATRAN/FIPE (decidido não corrigir
-  automaticamente, ver seção acima); limite de retenção pra
-  `silver.fipe_precos` ainda não definido (decisão de negócio, só anotada);
-  sem `gold.dim_fipe` — sem consumidor de trajetória de preço até TCO/Preço
-  Transacionado existirem.
-- **Join CNPJ × volume — feito** (`gold.dim_empresa`, 2026-08-20, ver seção "Demais
-  dimensões"). Pendências restantes desse item: as 3 tabelas brutas de CNPJ
-  (`bronze_master_cnpj`, `CNPJ_empresas_final`, `bronze_master_estabelecimentos`)
-  continuam residentes no MotherDuck só pra viabilizar refresh futuro de
-  `dim_empresa` — candidatas a migrar pro S3 (mesmo padrão do bronze de volumes),
-  ainda não decidido. Também: `staging.fipe_2024/2023/2022` (100% vazias, tentativa
-  abandonada de FIPE), `ADHOC_FILES.CNPJ_Empresas` e `staging.estab_y0` (dumps
-  brutos já superados pelas versões parseadas) e
-  `gold.fato_volumes_snapshot_pre_star` (backup antigo, já testado exaustivamente)
-  são candidatas seguras a apagar já — nenhuma ainda foi removida.
+- **Migrar anos restantes de Bronze pro armazenamento frio** — mesmo padrão já
+  aplicado às bases de CNPJ (ver "Retenção e armazenamento" acima).
+- **Join preço FIPE × volume — feito** (`gold.dim_veiculo_atual`, ver seção "Demais
+  dimensões"). Pendências restantes: tier 2 tem yield baixo em carros por divergência
+  de vocabulário DENATRAN/FIPE (decidido não corrigir automaticamente, ver seção
+  acima); limite de retenção pra `silver.fipe_precos` ainda não definido (decisão de
+  negócio, só anotada); sem `gold.dim_fipe` — sem consumidor de trajetória de preço
+  até TCO/Preço Transacionado existirem.
+- **Join CNPJ × volume — feito** (`gold.dim_empresa`, ver seção "Demais dimensões").
 - **`gold.semantic_dictionary`** — tabela de ontologia mais rica que
   `COMMENT ON COLUMN` (definição de negócio, exemplos, owner) — ideia registrada,
   não construída.
-- **Ativar login** (credenciais Google OAuth) e **migrar hospedagem** pra
-  Railway + Supabase Auth (hoje: Streamlit Community Cloud, restrição por e-mail).
-  Deve reconstruir `veiculo_atual_key` de qualquer forma se essa migração
-  reprocessar dados.
+- **Ativar login** (credenciais Google OAuth) e **migrar hospedagem** — plataforma
+  atual de hospedagem do app não suporta autenticação corporativa completa;
+  migração planejada quando usuário externo precisar de acesso direto (ver
+  `docs/architecture-roadmap.md`). Deve reconstruir `veiculo_atual_key` de qualquer
+  forma se essa migração reprocessar dados.
 - **MCP pra clientes externos** — não iniciado.
 - **Ingestão automática via Gmail/Drive** — planejada e aprovada, mas deliberadamente
-  adiada (2026-08-17): `docs/architecture-roadmap.md` item D2 já recomendava manter
-  intake manual até virar gargalo de verdade. Plano completo continua salvo, pronto
-  pra retomar se isso mudar.
-- **4 databases MotherDuck órfãos** (`bronze`, `silver`, `gold`, `my_db`, de
-  fevereiro, quase vazios, sem relação com os schemas reais dentro de
-  `Klume_DB_Cloud`) — seguros de apagar, ainda não confirmado com o usuário.
+  adiada: intake manual mantido até virar gargalo de verdade. Plano completo
+  continua salvo, pronto pra retomar se isso mudar.
