@@ -34,5 +34,5 @@ def blankify_view(
     if columns is None:
         columns = [row[0] for row in con.execute(f"DESCRIBE SELECT * FROM {source_relation}").fetchall()]
     select_list = ", ".join(f'blank_to_null("{c}") AS "{c}"' for c in columns)
-    con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT {select_list} FROM {source_relation}")
+    con.execute(f"CREATE OR REPLACE TEMP VIEW {view_name} AS SELECT {select_list} FROM {source_relation}")
     return view_name

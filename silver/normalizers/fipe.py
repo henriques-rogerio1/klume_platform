@@ -84,7 +84,7 @@ def normalize_fipe(con, source_relation: str = "staging.raw_json_fipe", *, stage
 
     blank_view = f"{stage_prefix}_blank"
     con.execute(f"""
-        CREATE OR REPLACE VIEW {blank_view} AS
+        CREATE OR REPLACE TEMP VIEW {blank_view} AS
         SELECT
             {", ".join(f'blank_to_null("{c}") AS "{c}"' for c in _BLANKABLE_COLUMNS)},
             vehicle_type, model_year
@@ -96,7 +96,7 @@ def normalize_fipe(con, source_relation: str = "staging.raw_json_fipe", *, stage
 
     typed_view = f"{stage_prefix}_typed"
     con.execute(f"""
-        CREATE OR REPLACE VIEW {typed_view} AS
+        CREATE OR REPLACE TEMP VIEW {typed_view} AS
         SELECT
             brand_name,
             vehicle_type,

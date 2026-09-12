@@ -55,5 +55,5 @@ def rename_to_snake_case(
     mapping = clean_columns(raw_names, overrides)
 
     select_list = ", ".join(f'"{raw}" AS "{clean}"' for raw, clean in mapping.items())
-    con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT {select_list} FROM {source_relation}")
+    con.execute(f"CREATE OR REPLACE TEMP VIEW {view_name} AS SELECT {select_list} FROM {source_relation}")
     return view_name

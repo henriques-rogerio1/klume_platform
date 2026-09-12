@@ -5,12 +5,16 @@ classificação) pra silver.veiculos.cnpj_basico_faturado.
 Escopo: só os cnpj_basico que já aparecem em silver.veiculos — não os ~65M CNPJs
 inteiros da Receita Federal, pra manter isso pequeno e barato de consultar.
 
-Fontes:
-  - staging.bronze_master_cnpj (40,4M linhas) + main.CNPJ_empresas_final (24,8M
+Fontes (arquivadas em Parquet no S3, não residentes no MotherDuck — as 3
+tabelas brutas foram exportadas e removidas do banco principal em
+2026-09-09 pra conter tamanho de armazenamento ativo, ver
+docs/POST-MORTEM.md; lidas sob demanda via read_parquet('s3://...') sempre
+que este refresh roda):
+  - bronze_master_cnpj (40,4M linhas) + CNPJ_empresas_final (24,8M
     linhas): mesma fonte "Empresas" da Receita Federal, zero sobreposição
     verificada entre as duas — juntas cobrem 99,98% dos CNPJs relevantes (uma
     sozinha não passa de 74,4%).
-  - staging.bronze_master_estabelecimentos (63,8M linhas): CNAE + nome fantasia,
+  - bronze_master_estabelecimentos (63,8M linhas): CNAE + nome fantasia,
     uma linha por estabelecimento (matriz + filiais) — pega a linha matriz.
 
 Refresh é manual, desacoplado do pipeline automático de upload — rodar direto
@@ -29,13 +33,29 @@ em gold/build_volumes.py::build_dim_veiculo_atual pro preço FIPE): a escolha
 Uso:
     python gold/build_dim_empresa.py                      # build normal
     python gold/build_dim_empresa.py --verify-determinism  # build 2x, diff (caro)
-Requer MOTHERDUCK_TOKEN no .env.
+Requer MOTHERDUCK_TOKEN e AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_REGION
+no .env (as fontes agora vêm de Parquet no S3, ver docstring das fontes acima).
 """
 
+import os
 import sys
+
+from dotenv import load_dotenv
 
 from gold.build_volumes import apply_comments, apply_grain_comments
 from silver.db.connection import get_connection
+
+
+def _register_s3_secret(con) -> None:
+    load_dotenv()
+    con.execute(f"""
+        CREATE OR REPLACE SECRET s3_dim_empresa (
+            TYPE s3,
+            KEY_ID '{os.getenv("AWS_ACCESS_KEY_ID")}',
+            SECRET '{os.getenv("AWS_SECRET_ACCESS_KEY")}',
+            REGION '{os.getenv("AWS_REGION")}'
+        )
+    """)
 
 GRAIN = {
     "dim_empresa": "Uma linha representa um cnpj_basico observado em "
@@ -72,6 +92,17 @@ COMMENTS = {
 
 
 def build_dim_empresa(con) -> None:
+    # empresa_key = hash(cnpj_basico) mascarado, não row_number() OVER
+    # (ORDER BY cnpj_basico) -- achado real: um CNPJ novo que ordena antes
+    # de um existente deslocava toda chave depois dele a cada refresh,
+    # corrompendo silenciosamente a FK já persistida em fato_volumes_base
+    # (refresh desta dimensão é desacoplado do build da fato, ver docstring
+    # do módulo). Hash não depende do estado do conjunto -- mesma correção
+    # aplicada em gold/build_volumes.py (dim_veiculo_observado/atual), ver
+    # comentário lá pro raciocínio completo (por que hash e não crosswalk,
+    # por que mascarar o bit de sinal antes do cast pra BIGINT). Derivação
+    # formal (determinismo vs. estabilidade referencial, diagrama de bits
+    # da máscara): skill dimensional-modeler.
     con.execute("""
         CREATE OR REPLACE TABLE gold.dim_empresa AS
         WITH relevantes AS (
@@ -85,13 +116,13 @@ def build_dim_empresa(con) -> None:
             FROM (
                 SELECT cnpj_basico, razao_social, natureza_juridica, qualificacao,
                        capital_social, porte, 'bronze_master_cnpj' AS fonte_empresas
-                FROM staging.bronze_master_cnpj
+                FROM read_parquet('s3://klume-volumes-s3-platform/cnpj-source-archive/staging_bronze_master_cnpj.parquet')
 
                 UNION ALL
 
                 SELECT cnpj_basico, razao_social, natureza_juridica, qualificacao,
                        capital_social, porte, 'CNPJ_empresas_final' AS fonte_empresas
-                FROM main.CNPJ_empresas_final
+                FROM read_parquet('s3://klume-volumes-s3-platform/cnpj-source-archive/main_CNPJ_empresas_final.parquet')
             )
             -- Defensivo: hoje as duas fontes têm zero sobreposição (verificado),
             -- mas não presume isso pra sempre — desempate total se algum dia
@@ -108,7 +139,7 @@ def build_dim_empresa(con) -> None:
             -- recurso pra garantir ordem total mesmo se nada mais desempatar.
             SELECT cnpj_basico, nome_fantasia, situacao_cadastral,
                    cnae_fiscal_principal, municipio, uf
-            FROM staging.bronze_master_estabelecimentos
+            FROM read_parquet('s3://klume-volumes-s3-platform/cnpj-source-archive/staging_bronze_master_estabelecimentos.parquet')
             QUALIFY row_number() OVER (
                 PARTITION BY cnpj_basico
                 ORDER BY (identificador_matriz_filial = '1') DESC, cnpj_ordem,
@@ -117,7 +148,7 @@ def build_dim_empresa(con) -> None:
             ) = 1
         )
         SELECT
-            row_number() OVER (ORDER BY r.cnpj_basico) AS empresa_key,
+            (hash(r.cnpj_basico) & 9223372036854775807)::BIGINT AS empresa_key,
             r.cnpj_basico,
             e.razao_social,
             e.natureza_juridica,
@@ -158,6 +189,7 @@ def main():
 
     con = get_connection("motherduck")
     con.execute("CREATE SCHEMA IF NOT EXISTS gold")
+    _register_s3_secret(con)
 
     print("Construindo dim_empresa...")
     build_dim_empresa(con)

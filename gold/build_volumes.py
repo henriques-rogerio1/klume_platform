@@ -156,14 +156,45 @@ def apply_comments(con, comments: dict = COMMENTS) -> None:
 
 
 def build_dim_veiculo_observado(con) -> None:
-    con.execute("""
+    # veiculo_key = hash determinístico das 9 colunas do grão, não mais
+    # row_number() OVER (ORDER BY ...) -- row_number() reordena TODAS as
+    # chaves existentes quando uma combinação nova aparece antes de uma
+    # existente na ordenação (achado real, mesmo padrão confirmado em
+    # gold.dim_empresa.empresa_key), corrompendo qualquer FK física já
+    # persistida em fato_volumes_base. Hash não depende do estado do
+    # conjunto -- K(e) não muda quando outra linha é inserida.
+    #
+    # COALESCE(col::VARCHAR, '§NULL§') em cada coluna antes do concat_ws:
+    # testado que concat_ws do DuckDB OMITE campo NULL inteiramente (não
+    # deixa nem o delimitador vazio) -- sem isso, uma linha com versao=NULL
+    # geraria a mesma string concatenada que uma linha com uma coluna a
+    # menos, colidindo em silêncio. '§' como delimitador por não ocorrer
+    # nos dados.
+    #
+    # Máscara do bit de sinal ANTES do cast pra BIGINT, não depois --
+    # hash(...)::BIGINT sozinho falha (Conversion Error) pra ~50% dos
+    # valores (qualquer hash >= 2^63 estoura o BIGINT positivo):
+    #   hash gerado (UBIGINT):  [ b63  b62 ... b0 ]
+    #   máscara (2^63 - 1):     [  0    1  ...  1 ]
+    #   AND bit a bit:          [  0   b62 ... b0 ]  -> sempre cabe em BIGINT positivo
+    # Derivação completa e a distinção determinismo-vs-estabilidade que
+    # motivou trocar ROW_NUMBER() por hash aqui: skill dimensional-modeler,
+    # seções "Determinismo vs. estabilidade referencial de surrogate keys"
+    # e "Hash determinístico como BIGINT".
+    con.execute(r"""
         CREATE OR REPLACE TABLE gold.dim_veiculo_observado AS
         SELECT
-            row_number() OVER (
-                ORDER BY vehicle_key, marca, modelo, versao, ano_modelo,
-                         combustivel_normalizado, segmentacao_atualizada,
-                         segmentacao_original, tipo_veiculo_principal
-            ) AS veiculo_key,
+            (hash(concat_ws('§',
+                COALESCE(vehicle_key::VARCHAR, '§NULL§'),
+                COALESCE(marca::VARCHAR, '§NULL§'),
+                COALESCE(modelo::VARCHAR, '§NULL§'),
+                COALESCE(versao::VARCHAR, '§NULL§'),
+                COALESCE(ano_modelo::VARCHAR, '§NULL§'),
+                COALESCE(combustivel_normalizado::VARCHAR, '§NULL§'),
+                COALESCE(segmentacao_atualizada::VARCHAR, '§NULL§'),
+                COALESCE(segmentacao_original::VARCHAR, '§NULL§'),
+                COALESCE(tipo_veiculo_principal::VARCHAR, '§NULL§')
+            )) & 9223372036854775807)::BIGINT AS veiculo_key,
             vehicle_key, marca, modelo, versao, ano_modelo,
             combustivel_normalizado, segmentacao_atualizada, segmentacao_original,
             tipo_veiculo_principal
@@ -208,10 +239,19 @@ def build_dim_veiculo_atual(con) -> None:
         ) = 1
     """)
 
+    # veiculo_atual_key = vehicle_key mascarado, não row_number() -- o grão
+    # já é 1 linha por vehicle_key (Type 1), e vehicle_key já é
+    # hash(canonical_str) UBIGINT vindo do Silver; gerar outro hash em cima
+    # seria hash de hash, redundante. Só a máscara do bit de sinal
+    # (mesma técnica de dim_veiculo_observado acima, ver diagrama lá) pra
+    # manter os dois BIGINT -- homogêneo com as outras chaves surrogate
+    # do star schema, custo desprezível. A máscara entra só nesta expressão
+    # final -- a.vehicle_key CRU continua sendo usado abaixo pro join de
+    # tier 3 do FIPE, não alterar isso.
     con.execute("""
         CREATE OR REPLACE TABLE gold.dim_veiculo_atual AS
         SELECT
-            row_number() OVER (ORDER BY a.vehicle_key) AS veiculo_atual_key,
+            (a.vehicle_key & 9223372036854775807)::BIGINT AS veiculo_atual_key,
             a.vehicle_key, a.marca, a.modelo, a.versao, a.ano_modelo, a.combustivel_normalizado,
             a.segmentacao_atualizada AS segmentacao_klume,
             a.segmentacao_original AS segmentacao_original_klume,
@@ -303,7 +343,12 @@ def build_fato_volumes_base(con) -> None:
             municipio_emplacamento, estado_emplacamento,
             cor_predominante, tipo_venda, match_tier, cnpj_basico_faturado,
             fipe, preco,
-            SUM(quantidade) AS quantidade
+            -- CAST explícito pra BIGINT: SUM() sobre INTEGER promove pra
+            -- HUGEINT por padrão no DuckDB (proteção genérica contra
+            -- overflow) -- volume real (~10,6M) cabe folgado em BIGINT
+            -- (8 bytes), sem motivo pra pagar HUGEINT (16 bytes) por linha
+            -- em ~7,7M linhas.
+            CAST(SUM(quantidade) AS BIGINT) AS quantidade
         FROM silver.veiculos
         GROUP BY ALL
     """)

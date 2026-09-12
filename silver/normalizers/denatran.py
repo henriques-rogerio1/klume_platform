@@ -25,7 +25,7 @@ SPLIT_YEAR = 2000
 
 def _type_cast(con, source_view: str, typed_view: str) -> str:
     con.execute(f"""
-        CREATE OR REPLACE VIEW {typed_view} AS
+        CREATE OR REPLACE TEMP VIEW {typed_view} AS
         SELECT
             COALESCE(
                 TRY_STRPTIME(data_emplacamento, '%Y%m%d'),
@@ -34,7 +34,13 @@ def _type_cast(con, source_view: str, typed_view: str) -> str:
             numero_chassi,
             placa_veiculo,
             tipo_faturado,
-            identificacao_faturado,
+            -- Mascarado pra qualquer coisa que não seja CNPJ (LGPD -- CPF de
+            -- pessoa física é dado pessoal sensível, sem uso downstream: nada
+            -- em Gold/app lê esta coluna, só cnpj_basico_faturado abaixo).
+            -- "Desconhecido"/"Outros" também mascarados por precaução -- não
+            -- dá pra confirmar que não é CPF sem o tipo_faturado correto.
+            CASE WHEN tipo_faturado = 'CNPJ' THEN identificacao_faturado ELSE NULL END
+                AS identificacao_faturado,
             tipo_venda,
             uf_faturado,
             tipo_proprietario,
@@ -98,12 +104,12 @@ def _split_by_year(con, typed_view: str, stage_prefix: str) -> tuple[str, str]:
     recent_view = f"{stage_prefix}_split_recent"
     historico_view = f"{stage_prefix}_split_historico"
     con.execute(f"""
-        CREATE OR REPLACE VIEW {recent_view} AS
+        CREATE OR REPLACE TEMP VIEW {recent_view} AS
         SELECT * FROM {typed_view}
         WHERE data_emplacamento IS NOT NULL AND date_part('year', data_emplacamento) >= {SPLIT_YEAR}
     """)
     con.execute(f"""
-        CREATE OR REPLACE VIEW {historico_view} AS
+        CREATE OR REPLACE TEMP VIEW {historico_view} AS
         SELECT * EXCLUDE (match_tier_raw, cnpj_basico_faturado), cnpj_basico_faturado
         FROM {typed_view}
         WHERE data_emplacamento IS NULL OR date_part('year', data_emplacamento) < {SPLIT_YEAR}
@@ -122,7 +128,7 @@ def _add_canonical_and_match_tier(
     register_sql_macros(con)
 
     con.execute(f"""
-        CREATE OR REPLACE VIEW {out_view}_base AS
+        CREATE OR REPLACE TEMP VIEW {out_view}_base AS
         SELECT
             *,
             canonical_str_denatran_sql(marca, versao, ano_modelo, combustivel) AS canonical_str,
@@ -132,7 +138,7 @@ def _add_canonical_and_match_tier(
 
     if mapping_table is None:
         con.execute(f"""
-            CREATE OR REPLACE VIEW {out_view} AS
+            CREATE OR REPLACE TEMP VIEW {out_view} AS
             SELECT * EXCLUDE (match_tier_raw), match_tier_raw AS match_tier
             FROM {out_view}_base
         """)
@@ -150,14 +156,14 @@ def _add_canonical_and_match_tier(
     # codigo_fipe_crosswalk e só aceita valor no formato real de código FIPE
     # (6 dígitos, hífen, 1 dígito).
     con.execute(f"""
-        CREATE OR REPLACE VIEW {out_view}_mapped AS
+        CREATE OR REPLACE TEMP VIEW {out_view}_mapped AS
         SELECT b.*, m."FIPE Carros Com Leves" AS fipe_tabela_polo
         FROM {out_view}_base b
         LEFT JOIN {mapping_table} m
           ON strip_accents(lower(trim(b.versao))) = strip_accents(lower(trim(m."MARCA/MODELO (original sem espaços)")))
     """)
     con.execute(f"""
-        CREATE OR REPLACE VIEW {out_view} AS
+        CREATE OR REPLACE TEMP VIEW {out_view} AS
         SELECT
             * EXCLUDE (match_tier_raw, fipe_tabela_polo),
             CASE

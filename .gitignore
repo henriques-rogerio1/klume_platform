@@ -11,3 +11,5 @@ venv/
 .DS_Store
 .streamlit/secrets.toml
 app/chroma_store/
+service_account*.json
+*service-account*.json

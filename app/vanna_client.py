@@ -13,6 +13,7 @@ isso não é nem possível (Streamlit Cloud não dá shell).
 
 import os
 
+import streamlit as st
 from vanna.legacy.anthropic import Anthropic_Chat
 from vanna.legacy.chromadb import ChromaDB_VectorStore
 
@@ -56,7 +57,13 @@ def ensure_trained(vn: KlumeVanna) -> None:
         vn.train(question=question, sql=sql)
 
 
+@st.cache_resource
 def get_vanna(anthropic_api_key: str) -> KlumeVanna:
+    # Cacheado por processo -- sem isso, ensure_trained() (3 queries no
+    # Chroma) rodava em todo rerun do Streamlit (todo clique, toda troca de
+    # widget), não só uma vez. O caminho de retreino-se-vazio continua
+    # existindo (self-heal depois de redeploy/chroma_store ausente), só
+    # para de rodar a checagem redundante em toda interação.
     vn = KlumeVanna(anthropic_api_key)
     ensure_trained(vn)
     return vn
