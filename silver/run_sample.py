@@ -12,8 +12,11 @@ Uso:
 Requer MOTHERDUCK_TOKEN no .env.
 """
 
+from silver.comments import COMMENTS, GRAIN, apply_comments, apply_grain_comments
 from silver.db.connection import get_connection
 from silver.normalizers.denatran import normalize_denatran
+
+_VEICULOS_TABLES = ("veiculos", "veiculos_historico")
 
 LOCAL_1957 = (
     "C:/Users/Rogerio Henriques/Documents/data/bronze/veiculos_raw"
@@ -74,6 +77,11 @@ def main():
     assert "vehicle_key" not in hist_cols, "silver.veiculos_historico não deveria ter vehicle_key"
     assert "canonical_str" not in hist_cols, "silver.veiculos_historico não deveria ter canonical_str"
     print("\nOK: silver.veiculos_historico não tem colunas de hash.")
+
+    print("\nAplicando comentários de grão (COMMENT ON TABLE)...")
+    apply_grain_comments(con, {k: v for k, v in GRAIN.items() if k in _VEICULOS_TABLES})
+    print("Aplicando comentários (ontologia)...")
+    apply_comments(con, {k: v for k, v in COMMENTS.items() if k in _VEICULOS_TABLES})
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ Uso:
 Requer MOTHERDUCK_TOKEN no .env.
 """
 
+from silver.comments import COMMENTS, GRAIN, apply_comments, apply_grain_comments
 from silver.db.connection import get_connection
 from silver.normalizers.fipe import normalize_fipe
 
@@ -40,6 +41,11 @@ def main():
 
     n_null_preco = con.execute("SELECT COUNT(*) FROM silver.fipe_precos WHERE preco IS NULL").fetchone()[0]
     print(f"preco nulo: {n_null_preco:,} de {total:,} ({n_null_preco/total:.1%})")
+
+    print("\nAplicando comentários de grão (COMMENT ON TABLE)...")
+    apply_grain_comments(con, {"fipe_precos": GRAIN["fipe_precos"]})
+    print("Aplicando comentários (ontologia)...")
+    apply_comments(con, {"fipe_precos": COMMENTS["fipe_precos"]})
 
     print("\npor vehicle_type:")
     for tipo, n in con.execute(
