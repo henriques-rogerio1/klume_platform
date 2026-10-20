@@ -6,6 +6,12 @@ numpy>=1.26.0
 streamlit>=1.61.0
 pandas>=3.0.0
 openpyxl>=3.1.0
+# anthropic fixado: a vanna/legacy/anthropic sempre passa temperature= pro
+# Messages.create(); versoes novas do SDK anthropic rejeitam esse kwarg e o
+# app quebra no Streamlit Cloud (resolve deps do zero) com
+# "TypeError: Messages.create() got an unexpected keyword argument 'temperature'".
+# 0.121.0 e a versao que roda OK local; pin evita deriva de versao na nuvem.
+anthropic==0.121.0
 vanna[chromadb,anthropic]>=2.0.2
 plotly>=6.9.0
 authlib>=1.3.2
